@@ -65,6 +65,7 @@ class ImagePyramide(torch.nn.Module):
 
     def forward(self, x):
         out_dict = {}
+        self.downs = self.downs.to(x.device)
         for scale, down_module in self.downs.items():
             out_dict['prediction_' + str(scale).replace('-', '.')] = down_module(x)
         return out_dict
@@ -74,22 +75,24 @@ class Transform:
     """
     Random tps transformation for equivariance constraints.
     """
-    def __init__(self, bs, **kwargs):
+    def __init__(self, bs, device, **kwargs):
+        self.device = device
         noise = torch.normal(mean=0, std=kwargs['sigma_affine'] * torch.ones([bs, 2, 3]))
-        self.theta = noise + torch.eye(2, 3).view(1, 2, 3)
+        self.theta = (noise + torch.eye(2, 3).view(1, 2, 3)).to(self.device)
         self.bs = bs
 
         if ('sigma_tps' in kwargs) and ('points_tps' in kwargs):
             self.tps = True
-            self.control_points = make_coordinate_grid_2d((kwargs['points_tps'], kwargs['points_tps']), type=noise.type())
+            self.control_points = (make_coordinate_grid_2d((kwargs['points_tps'], kwargs['points_tps']), type=noise.type())).to(self.device)
             self.control_points = self.control_points.unsqueeze(0)
             self.control_params = torch.normal(mean=0,
                                                std=kwargs['sigma_tps'] * torch.ones([bs, 1, kwargs['points_tps'] ** 2]))
+            self.control_params = self.control_params.to(self.device)
         else:
             self.tps = False
 
     def transform_frame(self, frame):
-        grid = make_coordinate_grid_2d(frame.shape[2:], type=frame.type()).unsqueeze(0)
+        grid = (make_coordinate_grid_2d(frame.shape[2:], type=frame.type()).unsqueeze(0)).to(frame.device)
         grid = grid.view(1, frame.shape[2] * frame.shape[3], 2)
         grid = self.warp_coordinates(grid).view(self.bs, frame.shape[2], frame.shape[3], 2)
         return F.grid_sample(frame, grid, padding_mode="reflection")
@@ -229,7 +232,7 @@ class GeneratorFullModel(torch.nn.Module):
     Merge all generator related updates into single model for better multi-gpu usage
     """
 
-    def __init__(self, kp_extractor, he_estimator, generator, discriminator, train_params, estimate_jacobian=True):
+    def __init__(self, kp_extractor, he_estimator, generator, discriminator, train_params, estimate_jacobian=True, device=None):
         super(GeneratorFullModel, self).__init__()
         self.kp_extractor = kp_extractor
         self.he_estimator = he_estimator
@@ -248,16 +251,16 @@ class GeneratorFullModel(torch.nn.Module):
 
         if sum(self.loss_weights['perceptual']) != 0:
             self.vgg = Vgg19()
-            if torch.cuda.is_available():
-                self.vgg = self.vgg.cuda()
+            if torch.cuda.is_available() and device!=None:
+                self.vgg = self.vgg.to(device)
 
         if self.loss_weights['headpose'] != 0:
             self.hopenet = hopenet.Hopenet(models.resnet.Bottleneck, [3, 4, 6, 3], 66)
             print('Loading hopenet')
             hopenet_state_dict = torch.load(train_params['hopenet_snapshot'])
             self.hopenet.load_state_dict(hopenet_state_dict)
-            if torch.cuda.is_available():
-                self.hopenet = self.hopenet.cuda()
+            if torch.cuda.is_available() and device!=None:
+                self.hopenet = self.hopenet.to(device)
                 self.hopenet.eval()
 
 
@@ -318,7 +321,7 @@ class GeneratorFullModel(torch.nn.Module):
                     loss_values['feature_matching'] = value_total
 
         if (self.loss_weights['equivariance_value'] + self.loss_weights['equivariance_jacobian']) != 0:
-            transform = Transform(x['driving'].shape[0], **self.train_params['transform_params'])
+            transform = Transform(x['driving'].shape[0], device=x['source'].device, **self.train_params['transform_params'])
             transformed_frame = transform.transform_frame(x['driving'])
 
             transformed_he_driving = self.he_estimator(transformed_frame)
@@ -355,20 +358,29 @@ class GeneratorFullModel(torch.nn.Module):
                 loss_values['equivariance_jacobian'] = self.loss_weights['equivariance_jacobian'] * value
 
         if self.loss_weights['keypoint'] != 0:
-            # print(kp_driving['value'].shape)     # (bs, k, 3)
-            value_total = 0
-            for i in range(kp_driving['value'].shape[1]):
-                for j in range(kp_driving['value'].shape[1]):
-                    dist = F.pairwise_distance(kp_driving['value'][:, i, :], kp_driving['value'][:, j, :], p=2, keepdim=True) ** 2
-                    dist = 0.1 - dist      # set Dt = 0.1
-                    dd = torch.gt(dist, 0) 
-                    value = (dist * dd).mean()
-                    value_total += value
+            # Compute pairwise distances for all pairs of keypoints at once
+            kp_values = kp_driving['value']
+            # batch_size, num_keypoints, _ = kp_values.shape
 
-            kp_mean_depth = kp_driving['value'][:, :, -1].mean(-1)
-            value_depth = torch.abs(kp_mean_depth - 0.33).mean()          # set Zt = 0.33
+            # Reshape to enable broadcasting for pairwise distance calculation
+            kp_values_i = kp_values.unsqueeze(2)  # Shape: (bs, k, 1, 3)
+            kp_values_j = kp_values.unsqueeze(1)  # Shape: (bs, 1, k, 3)
+            
+            # Calculate squared Euclidean distances between all pairs (bs, k, k)
+            dist_matrix = F.pairwise_distance(kp_values_i, kp_values_j, p=2).pow(2)
 
-            value_total += value_depth
+            # Apply the threshold and mask
+            dist_matrix = 0.1 - dist_matrix
+            mask = dist_matrix > 0
+            value_matrix = dist_matrix * mask  # Only keep values where distance is positive
+            value_total = value_matrix.mean(dim=(1, 2))  # Average over keypoint pairs in each batch
+
+            # Depth component
+            kp_mean_depth = kp_values[:, :, -1].mean(dim=-1)
+            value_depth = torch.abs(kp_mean_depth - 0.33).mean()
+
+            # Combine the distance and depth values for the final loss
+            value_total = value_total.mean() + value_depth
             loss_values['keypoint'] = self.loss_weights['keypoint'] * value_total
 
         if self.loss_weights['headpose'] != 0:
@@ -401,16 +413,17 @@ class DiscriminatorFullModel(torch.nn.Module):
     Merge all discriminator related updates into single model for better multi-gpu usage
     """
 
-    def __init__(self, kp_extractor, generator, discriminator, train_params):
+    def __init__(self, kp_extractor, generator, discriminator, train_params, device):
         super(DiscriminatorFullModel, self).__init__()
         self.kp_extractor = kp_extractor
         self.generator = generator
         self.discriminator = discriminator
         self.train_params = train_params
         self.scales = self.discriminator.scales
+        self.device = device
         self.pyramid = ImagePyramide(self.scales, generator.image_channel)
         if torch.cuda.is_available():
-            self.pyramid = self.pyramid.cuda()
+            self.pyramid = self.pyramid.to(self.device)
 
         self.loss_weights = train_params['loss_weights']
 
@@ -418,7 +431,7 @@ class DiscriminatorFullModel(torch.nn.Module):
 
     def get_zero_tensor(self, input):
         if self.zero_tensor is None:
-            self.zero_tensor = torch.FloatTensor(1).fill_(0).cuda()
+            self.zero_tensor = torch.FloatTensor(1).fill_(0).to(self.device)
             self.zero_tensor.requires_grad_(False)
         return self.zero_tensor.expand_as(input)
 

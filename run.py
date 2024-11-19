@@ -8,7 +8,7 @@ from argparse import ArgumentParser
 from time import gmtime, strftime
 from shutil import copy
 
-from frames_dataset import FramesDataset
+from frames_dataset import FramesDataset, ImagesDataset
 
 from modules.generator import OcclusionAwareGenerator, OcclusionAwareSPADEGenerator
 from modules.discriminator import MultiScaleDiscriminator
@@ -17,6 +17,8 @@ from modules.keypoint_detector import KPDetector, HEEstimator
 import torch
 
 from train import train
+import warnings
+warnings.filterwarnings("ignore")
 
 if __name__ == "__main__":
     
@@ -42,7 +44,7 @@ if __name__ == "__main__":
         log_dir = os.path.join(*os.path.split(opt.checkpoint)[:-1])
     else:
         log_dir = os.path.join(opt.log_dir, os.path.basename(opt.config).split('.')[0])
-        log_dir += ' ' + strftime("%d_%m_%y_%H.%M.%S", gmtime())
+        log_dir += '_' + strftime("%d_%m_%y_%H.%M.%S", gmtime()) + '_device_' + str(opt.device_ids[0])
         
 
     if opt.gen == 'original':
@@ -80,7 +82,8 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         he_estimator.to(opt.device_ids[0])
 
-    dataset = FramesDataset(is_train=(opt.mode == 'train'), **config['dataset_params'])
+    # dataset = FramesDataset(is_train=(opt.mode == 'train'), **config['dataset_params'])
+    dataset = ImagesDataset(is_train=(opt.mode == 'train'), **config['dataset_params'])
 
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)

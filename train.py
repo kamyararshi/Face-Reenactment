@@ -1,4 +1,4 @@
-from tqdm import trange
+from tqdm import trange, tqdm
 import torch
 
 from torch.utils.data import DataLoader
@@ -15,6 +15,7 @@ from frames_dataset import DatasetRepeater
 
 def train(config, generator, discriminator, kp_detector, he_estimator, checkpoint, log_dir, dataset, device_ids):
     train_params = config['train_params']
+    device = f"cuda:{device_ids[0]}"
 
     optimizer_generator = torch.optim.Adam(generator.parameters(), lr=train_params['lr_generator'], betas=(0.5, 0.999))
     optimizer_discriminator = torch.optim.Adam(discriminator.parameters(), lr=train_params['lr_discriminator'], betas=(0.5, 0.999))
@@ -40,16 +41,17 @@ def train(config, generator, discriminator, kp_detector, he_estimator, checkpoin
         dataset = DatasetRepeater(dataset, train_params['num_repeats'])
     dataloader = DataLoader(dataset, batch_size=train_params['batch_size'], shuffle=True, num_workers=16, drop_last=True)
 
-    generator_full = GeneratorFullModel(kp_detector, he_estimator, generator, discriminator, train_params, estimate_jacobian=config['model_params']['common_params']['estimate_jacobian'])
-    discriminator_full = DiscriminatorFullModel(kp_detector, generator, discriminator, train_params)
+    generator_full = GeneratorFullModel(kp_detector, he_estimator, generator, discriminator, train_params, estimate_jacobian=config['model_params']['common_params']['estimate_jacobian'], device=device)
+    discriminator_full = DiscriminatorFullModel(kp_detector, generator, discriminator, train_params, device=device)
 
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and len(device_ids)>1 and False:
         generator_full = DataParallelWithCallback(generator_full, device_ids=device_ids)
         discriminator_full = DataParallelWithCallback(discriminator_full, device_ids=device_ids)
 
     with Logger(log_dir=log_dir, visualizer_params=config['visualizer_params'], checkpoint_freq=train_params['checkpoint_freq']) as logger:
         for epoch in trange(start_epoch, train_params['num_epochs']):
-            for x in dataloader:
+            for x in tqdm(dataloader):
+                x = {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in x.items()}
                 losses_generator, generated = generator_full(x)
 
                 loss_values = [val.mean() for val in losses_generator.values()]
@@ -78,6 +80,7 @@ def train(config, generator, discriminator, kp_detector, he_estimator, checkpoin
                 losses_generator.update(losses_discriminator)
                 losses = {key: value.mean().detach().data.cpu().numpy() for key, value in losses_generator.items()}
                 logger.log_iter(losses=losses)
+                logger.log_scores(logger.names)
 
             scheduler_generator.step()
             scheduler_discriminator.step()

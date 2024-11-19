@@ -38,6 +38,7 @@ class Logger:
 
     def visualize_rec(self, inp, out):
         image = self.visualizer.visualize(inp['driving'], inp['source'], out)
+        # source, transformed, driving, pred, occlusion, mask0(no color), mask1, mask2, mask3, ..., mask15 
         imageio.imsave(os.path.join(self.visualizations_dir, "%s-rec.png" % str(self.epoch).zfill(self.zfill_num)), image)
 
     def save_cpk(self, emergent=False):
@@ -95,7 +96,7 @@ class Logger:
         self.models = models
         if (self.epoch + 1) % self.checkpoint_freq == 0:
             self.save_cpk()
-        self.log_scores(self.names)
+        # self.log_scores(self.names)
         self.visualize_rec(inp, out)
 
 

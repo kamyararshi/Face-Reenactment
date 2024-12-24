@@ -16,7 +16,7 @@ def kp2gaussian(kp, spatial_size, kp_variance):
     """
     mean = kp['value']
 
-    coordinate_grid = (make_coordinate_grid(spatial_size, mean.type())).to(mean.device)
+    coordinate_grid = make_coordinate_grid(spatial_size, mean.type(), device=mean.device)
     number_of_leading_dimensions = len(mean.shape) - 1
     shape = (1,) * number_of_leading_dimensions + coordinate_grid.shape
     coordinate_grid = coordinate_grid.view(*shape)
@@ -33,13 +33,13 @@ def kp2gaussian(kp, spatial_size, kp_variance):
 
     return out
 
-def make_coordinate_grid_2d(spatial_size, type):
+def make_coordinate_grid_2d(spatial_size, type, device):
     """
     Create a meshgrid [-1,1] x [-1,1] of given spatial_size.
     """
     h, w = spatial_size
-    x = torch.arange(w).type(type)
-    y = torch.arange(h).type(type)
+    x = torch.arange(w, device=device).type(type)
+    y = torch.arange(h, device=device).type(type)
 
     x = (2 * (x / (w - 1)) - 1)
     y = (2 * (y / (h - 1)) - 1)
@@ -49,14 +49,27 @@ def make_coordinate_grid_2d(spatial_size, type):
 
     meshed = torch.cat([xx.unsqueeze_(2), yy.unsqueeze_(2)], 2)
 
-    return meshed
+    return meshed.to(device)
 
-
-def make_coordinate_grid(spatial_size, type):
+# Extend to 3D TPS grid if TPS is used
+def make_coordinate_grid_3d(spatial_size, type, device):
+    """
+    Create a 3D coordinate grid for the given spatial size.
+    """
     d, h, w = spatial_size
-    x = torch.arange(w).type(type)
-    y = torch.arange(h).type(type)
-    z = torch.arange(d).type(type)
+    x = torch.linspace(-1, 1, steps=w, device=device).type(type)
+    y = torch.linspace(-1, 1, steps=h, device=device).type(type)
+    z = torch.linspace(-1, 1, steps=d, device=device).type(type)
+    # grid = torch.meshgrid(x, y, z, indexing='ij')
+    grid = torch.meshgrid(x, y, z)
+    grid = torch.stack(grid, dim=-1)
+    return (grid.view(-1, 3)).to(device)
+
+def make_coordinate_grid(spatial_size, type, device):
+    d, h, w = spatial_size
+    x = torch.arange(w, device=device).type(type)
+    y = torch.arange(h, device=device).type(type)
+    z = torch.arange(d, device=device).type(type)
 
     x = (2 * (x / (w - 1)) - 1)
     y = (2 * (y / (h - 1)) - 1)
@@ -186,7 +199,7 @@ class UpBlock3d(nn.Module):
 
     def forward(self, x):
         # out = F.interpolate(x, scale_factor=(1, 2, 2), mode='trilinear')
-        out = F.interpolate(x, scale_factor=(1, 2, 2))
+        out = F.interpolate(x, scale_factor=(1, 2, 2)) #TODO: Use convTranspose to have learnable params
         out = self.conv(out)
         out = self.norm(out)
         out = F.relu(out)

@@ -33,7 +33,7 @@ class DenseMotionNetwork(nn.Module):
 
     def create_sparse_motions(self, feature, kp_driving, kp_source):
         bs, _, d, h, w = feature.shape
-        identity_grid = (make_coordinate_grid((d, h, w), type=kp_source['value'].type())).to(feature.device)
+        identity_grid = make_coordinate_grid((d, h, w), type=kp_source['value'].type(), device=feature.device)
         identity_grid = identity_grid.view(1, 1, d, h, w, 3)
         coordinate_grid = identity_grid - kp_driving['value'].view(bs, self.num_kp, 1, 1, 1, 3)
         
@@ -98,7 +98,7 @@ class DenseMotionNetwork(nn.Module):
 
         out_dict = dict()
         sparse_motion = self.create_sparse_motions(feature, kp_driving, kp_source)
-        deformed_feature = self.create_deformed_feature(feature, sparse_motion)
+        deformed_feature = self.create_deformed_feature(feature, sparse_motion) #NOTE: Warps the feature with the sparse_motion
 
         heatmap = self.create_heatmap_representations(deformed_feature, kp_driving, kp_source)
 

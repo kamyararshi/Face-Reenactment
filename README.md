@@ -1,35 +1,18 @@
-# One-Shot Free-View Neural Talking Head Synthesis
+# Unsupervised Face Reenactment
 Unofficial pytorch implementation of paper "One-Shot Free-View Neural Talking-Head Synthesis for Video Conferencing".  
 
 ```Python 3.6``` and ```Pytorch 1.7``` are used. 
 
-
-Updates:  
--------- 
-```2021.11.05``` :
-* <s>Replace Jacobian with the rotation matrix (Assuming J = R) to avoid estimating Jacobian.</s> 
-* Correct the rotation matrix.
-
-```2021.11.17``` :
-* Better Generator, better performance (models and checkpoints have been released).  
-
-Driving | Beta Version | FOMM | New Version:  
-
-
-https://user-images.githubusercontent.com/17874285/142828000-db7b324e-c2fd-4fdc-a272-04fb8adbc88a.mp4
-
-
+To Do's:
 --------
-Driving | FOMM | Ours:    
-![show](https://github.com/zhanglonghao1992/ReadmeImages/blob/master/images/081.gif) 
-
-Free-View:  
-![show](https://github.com/zhanglonghao1992/ReadmeImages/blob/master/images/concat.gif) 
+1. Change the equivariance keypoints loss from calculating on 2D to 3D keypoints
+2. Predict flow masks using a self-attention mechanism or transformer enc-decoder
+3. Estimate the warping fields in a better way than Fist-Order approx
 
 Train:  
 --------
 ```
-python run.py --config config/vox-256.yaml --device_ids 0,1,2,3,4,5,6,7
+python run.py --config config/vox-256.yaml --device_ids 0,1,2,3
 ```
 
 Demo:  
@@ -46,11 +29,10 @@ Note: run ```crop-video.py --inp driving_video.mp4``` first to get the cropping 
 Pretrained Model:  
 --------
 
-  Model  |  Train Set   | Baidu Netdisk | Media Fire | 
+  Model  |  Train Set   | - | - | 
  ------- |------------  |-----------    |--------      |
- Vox-256-Beta| VoxCeleb-v1  | [Baidu](https://pan.baidu.com/s/1lLS4ArbK2yWelsL-EtwU8g) (PW: c0tc)|  [MF](https://www.mediafire.com/folder/rw51an7tk7bh2/TalkingHead)  |
- Vox-256-New | VoxCeleb-v1  |  -  |  [MF](https://www.mediafire.com/folder/fcvtkn21j57bb/TalkingHead_Update)  |
- Vox-512 | VoxCeleb-v2  |  soon  |  soon  |
+ Vox-256-Beta| VoxCeleb-v1  | - |  -  |
+
  
  Note:
  1. <s>For now, the Beta Version is not well tuned.</s>
@@ -61,4 +43,4 @@ Pretrained Model:
 
 Acknowlegement: 
 --------
-Thanks to [NV](https://github.com/NVlabs/face-vid2vid), [AliaksandrSiarohin](https://github.com/AliaksandrSiarohin/first-order-model) and [DeepHeadPose](https://github.com/DriverDistraction/DeepHeadPose).
+Thanks to [NV](https://github.com/NVlabs/face-vid2vid), [AliaksandrSiarohin](https://github.com/AliaksandrSiarohin/first-order-model), [Wang et. al](https://arxiv.org/pdf/2011.15126), and [DeepHeadPose](https://github.com/DriverDistraction/DeepHeadPose).

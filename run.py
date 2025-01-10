@@ -16,7 +16,6 @@ from modules.keypoint_detector import KPDetector, HEEstimator
 
 import torch
 
-from train import train
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -27,11 +26,11 @@ if __name__ == "__main__":
 
     parser = ArgumentParser()
     parser.add_argument("--config", default="config/vox-256.yaml", help="path to config")
-    parser.add_argument("--mode", default="train", choices=["train",])
+    parser.add_argument("--mode", default="train", choices=["train", "generate"])
     parser.add_argument("--gen", default="original", choices=["original", "spade"])
     parser.add_argument("--log_dir", default='log', help="path to log into")
     parser.add_argument("--checkpoint", default=None, help="path to checkpoint to restore")
-    parser.add_argument("--device_ids", default="0, 1, 2, 3, 4, 5, 6, 7", type=lambda x: list(map(int, x.split(','))),
+    parser.add_argument("--device_ids", default="0", type=lambda x: list(map(int, x.split(','))),
                         help="Names of the devices comma separated.")
     parser.add_argument("--verbose", dest="verbose", action="store_true", help="Print model architecture")
     parser.set_defaults(verbose=False)
@@ -40,11 +39,13 @@ if __name__ == "__main__":
     with open(opt.config) as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
 
+    device_id = opt.device_ids[0]
+
     if opt.checkpoint is not None:
         log_dir = os.path.join(*os.path.split(opt.checkpoint)[:-1])
     else:
         log_dir = os.path.join(opt.log_dir, os.path.basename(opt.config).split('.')[0])
-        log_dir += '_' + strftime("%d_%m_%y_%H.%M.%S", gmtime()) + '_device_' + str(opt.device_ids[0])
+        log_dir += '_' + strftime("%d_%m_%y_%H.%M.%S", gmtime()) + '_device_' + str(device_id)
         
 
     if opt.gen == 'original':
@@ -56,14 +57,14 @@ if __name__ == "__main__":
 
     if torch.cuda.is_available():
         print('cuda is available')
-        generator.to(opt.device_ids[0])
+        generator.to(device_id)
     if opt.verbose:
         print(generator)
 
     discriminator = MultiScaleDiscriminator(**config['model_params']['discriminator_params'],
                                             **config['model_params']['common_params'])
     if torch.cuda.is_available():
-        discriminator.to(opt.device_ids[0])
+        discriminator.to(device_id)
     if opt.verbose:
         print(discriminator)
 
@@ -71,7 +72,7 @@ if __name__ == "__main__":
                              **config['model_params']['common_params'])
 
     if torch.cuda.is_available():
-        kp_detector.to(opt.device_ids[0])
+        kp_detector.to(device_id)
 
     if opt.verbose:
         print(kp_detector)
@@ -80,10 +81,12 @@ if __name__ == "__main__":
                                **config['model_params']['common_params'])
 
     if torch.cuda.is_available():
-        he_estimator.to(opt.device_ids[0])
+        he_estimator.to(device_id)
 
-    # dataset = FramesDataset(is_train=(opt.mode == 'train'), **config['dataset_params'])
-    dataset = ImagesDataset(is_train=(opt.mode == 'train'), **config['dataset_params'])
+    if opt.mode == 'train':
+        # dataset = FramesDataset(is_train=(opt.mode == 'train'), **config['dataset_params'])
+        dataset = ImagesDataset(is_train=True, **config['dataset_params'])
+        val_dataset = ImagesDataset(is_train=False, **config['dataset_params'])
 
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
@@ -91,5 +94,14 @@ if __name__ == "__main__":
         copy(opt.config, log_dir)
 
     if opt.mode == 'train':
-        print("Training...")
-        train(config, generator, discriminator, kp_detector, he_estimator, opt.checkpoint, log_dir, dataset, opt.device_ids)
+        if len(opt.device_ids)>1 and torch.cuda.device_count()>1:
+            from train_ddp import train
+            import torch.multiprocessing as mp
+            print("Training with DDP...")
+            world_size = len(opt.device_ids)
+            mp.spawn(train, args=(world_size, config, generator, discriminator, kp_detector, he_estimator, opt.checkpoint, log_dir, dataset, val_dataset),
+                     nprocs=world_size, join=True)
+        else:
+            from train import train
+            print("Training with Single GPU...")
+            train(config, generator, discriminator, kp_detector, he_estimator, opt.checkpoint, log_dir, dataset, val_dataset, device_id)

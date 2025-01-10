@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.distributed import destroy_process_group
 import imageio
 
 import os
@@ -11,7 +12,7 @@ import collections
 
 
 class Logger:
-    def __init__(self, log_dir, checkpoint_freq=100, visualizer_params=None, zfill_num=8, log_file_name='log.txt'):
+    def __init__(self, log_dir, checkpoint_freq=100, visualizer_params=None, zfill_num=8, log_file_name='log.txt', writer=None, ddp=False):
 
         self.loss_list = []
         self.cpk_dir = log_dir
@@ -23,8 +24,11 @@ class Logger:
         self.visualizer = Visualizer(**visualizer_params)
         self.checkpoint_freq = checkpoint_freq
         self.epoch = 0
+        self.global_epoch = 0
         self.best_loss = float('inf')
         self.names = None
+        self.writer = writer
+        self.ddp = ddp
 
     def log_scores(self, loss_names):
         loss_mean = np.array(self.loss_list).mean(axis=0)
@@ -42,16 +46,20 @@ class Logger:
         imageio.imsave(os.path.join(self.visualizations_dir, "%s-rec.png" % str(self.epoch).zfill(self.zfill_num)), image)
 
     def save_cpk(self, emergent=False):
-        cpk = {k: v.state_dict() for k, v in self.models.items()}
+        if self.ddp:
+            cpk = {k: v.state_dict() for k, v in self.models.items()}
+        else:
+            cpk = {k: v.state_dict() for k, v in self.models.items()}
         cpk['epoch'] = self.epoch
+        cpk['global_epoch'] = self.global_epoch
         cpk_path = os.path.join(self.cpk_dir, '%s-checkpoint.pth.tar' % str(self.epoch).zfill(self.zfill_num)) 
         if not (os.path.exists(cpk_path) and emergent):
             torch.save(cpk, cpk_path)
 
     @staticmethod
     def load_cpk(checkpoint_path, generator=None, discriminator=None, kp_detector=None, he_estimator=None,
-                 optimizer_generator=None, optimizer_discriminator=None, optimizer_kp_detector=None, optimizer_he_estimator=None):
-        checkpoint = torch.load(checkpoint_path)
+                 optimizer_generator=None, optimizer_discriminator=None, optimizer_kp_detector=None, optimizer_he_estimator=None, map_location='cpu'):
+        checkpoint = torch.load(checkpoint_path, map_location=map_location)
         if generator is not None:
             generator.load_state_dict(checkpoint['generator'])
         if kp_detector is not None:
@@ -75,7 +83,7 @@ class Logger:
         if optimizer_he_estimator is not None:
             optimizer_he_estimator.load_state_dict(checkpoint['optimizer_he_estimator'])
 
-        return checkpoint['epoch']
+        return checkpoint['epoch'], checkpoint['global_epoch']
 
     def __enter__(self):
         return self
@@ -83,6 +91,10 @@ class Logger:
     def __exit__(self, exc_type, exc_val, exc_tb):
         if 'models' in self.__dict__:
             self.save_cpk()
+        if self.writer is not None:
+            self.writer.close()
+        if self.ddp:
+            destroy_process_group()
         self.log_file.close()
 
     def log_iter(self, losses):
@@ -91,9 +103,10 @@ class Logger:
             self.names = list(losses.keys())
         self.loss_list.append(list(losses.values()))
 
-    def log_epoch(self, epoch, models, inp, out):
+    def log_epoch(self, epoch, global_epoch, models, inp, out):
         self.epoch = epoch
         self.models = models
+        self.global_epoch = global_epoch
         if (self.epoch + 1) % self.checkpoint_freq == 0:
             self.save_cpk()
         # self.log_scores(self.names)

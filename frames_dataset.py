@@ -83,7 +83,11 @@ class ImagesDataset(Dataset):
             self.classes_list = os.listdir(self.data_dir)[:dataset_amount]
             self.num_classes = len(self.classes_list)
         
-
+        # Pre process transfomrs
+        self.pre_transform = transforms.Compose([
+            transforms.ToTensor(),
+            #Resize(size=(self.img_size[0], self.img_size[1])), #IDK Why it warns to put str
+        ])
 
         # Calculate the total number of frames available in root
         for _, _, files in os.walk(self.root, topdown=False):
@@ -117,29 +121,47 @@ class ImagesDataset(Dataset):
         img1_raw = Image.open(sample1_path)
         img2_raw = Image.open(sample2_path)
 
-        # Pre process transfomrs
-        self.pre_transform = transforms.Compose([
-            transforms.ToTensor(),
-            #Resize(size=(self.img_size[0], self.img_size[1])), #IDK Why it warns to put str
-        ])
 
         out = {}
         if self.is_train and self.use_augmentation:
             out['driving']  = self.transform(self.pre_transform(img1_raw))
             out['source'] = self.transform(self.pre_transform(img2_raw))
 
-        elif self.is_train and not self.use_augmentation:
+        elif (self.is_train and not self.use_augmentation) or not self.is_train:
             out['driving']  = self.pre_transform(img1_raw)
             out['source'] = self.pre_transform(img2_raw)
         else:
             # video = np.array(video_array, dtype='float32')
             # out['video'] = video.transpose((3, 0, 1, 2))
-            out['video']=images_list
+            # out['video']=images_list
+            raise ValueError("Invalid Mode. Should be either train or test")
 
         out['name'] = random_class
 
         return out
 
+class AllFrames(Dataset):
+    def __init__(self, root_dir):
+        super().__init__()
+        self.root = root_dir
+        self.all = []
+        for i, _, k in os.walk(self.root, topdown=False):
+            self.all += [os.path.join(i, name) for name in k]
+
+        # Pre process transfomrs
+        self.pre_transform = transforms.Compose([
+            transforms.ToTensor(),
+            #Resize(size=(self.img_size[0], self.img_size[1])), #IDK Why it warns to put str
+        ])
+        
+        self.len = len(self.all)
+
+    def __len__(self):
+        return self.len
+
+    def __getitem__(self, idx):
+        img = Image.open(self.all[idx])
+        return self.pre_transform(img)
 
 class FramesDataset(Dataset):
     """

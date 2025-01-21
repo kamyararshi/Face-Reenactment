@@ -61,8 +61,8 @@ class DenseMotionNetwork(nn.Module):
         driving_to_source = coordinate_grid + kp_source['value'].view(bs, self.num_kp, 1, 1, 1, 3)    # (bs, num_kp, d, h, w, 3)
 
         #adding background feature
-        identity_grid = identity_grid.repeat(bs, 1, 1, 1, 1, 1)
-        sparse_motions = torch.cat([identity_grid, driving_to_source], dim=1)
+        identity_grid = identity_grid.repeat(bs, 1, 1, 1, 1, 1) # (bs, 1, d, h, w, 3) NOTE: repeat only the batch dimension
+        sparse_motions = torch.cat([identity_grid, driving_to_source], dim=1) # [(bs, 1, d, h, w, 3), (bs, num_kp, d, h, w, 3)] -> (bs, num_kp+1, d, h, w, 3)
         
         # sparse_motions = driving_to_source
 
@@ -107,9 +107,9 @@ class DenseMotionNetwork(nn.Module):
 
         # input = deformed_feature.view(bs, -1, d, h, w)      # (bs, num_kp+1 * c, d, h, w)
 
-        prediction = self.hourglass(input)
+        prediction = self.hourglass(input) #NOTE: An encoder-decoder network
 
-        mask = self.mask(prediction)
+        mask = self.mask(prediction) #TODO: A 3D convolutional layer that outputs the mask
         mask = F.softmax(mask, dim=1)
         out_dict['mask'] = mask
         mask = mask.unsqueeze(2)                                   # (bs, num_kp+1, 1, d, h, w)

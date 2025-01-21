@@ -2,6 +2,9 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from modules.util import ResBlock2d, SameBlock2d, UpBlock2d, DownBlock2d, ResBlock3d, SPADEResnetBlock
+from modules.util import mesh_grid, norm_grid
+from modules.expression_encoder import get_expression_encoder
+from modules.expression_warper import ExpressionWarper
 from modules.dense_motion import DenseMotionNetwork
 
 
@@ -11,7 +14,7 @@ class OcclusionAwareGenerator(nn.Module):
     """
 
     def __init__(self, image_channel, feature_channel, num_kp, block_expansion, max_features, num_down_blocks, reshape_channel, reshape_depth,
-                 num_resblocks, estimate_occlusion_map=False, dense_motion_params=None, estimate_jacobian=False):
+                 num_resblocks, estimate_occlusion_map=False, dense_motion_params=None, expression_enc_params=None, estimate_jacobian=False):
         super(OcclusionAwareGenerator, self).__init__()
 
         if dense_motion_params is not None:
@@ -21,6 +24,13 @@ class OcclusionAwareGenerator(nn.Module):
         else:
             self.dense_motion_network = None
 
+        if expression_enc_params is not None:
+            self.expression_encoder = get_expression_encoder(**expression_enc_params)
+            self.expression_warper = ExpressionWarper(expression_enc_params['num_classes'])
+        else:
+            self.expression_encoder = None
+            self.expression_warper = None
+        
         self.first = SameBlock2d(image_channel, block_expansion, kernel_size=(7, 7), padding=(3, 3))
 
         down_blocks = []
@@ -62,12 +72,36 @@ class OcclusionAwareGenerator(nn.Module):
         _, d_old, h_old, w_old, _ = deformation.shape
         _, _, d, h, w = inp.shape
         if d_old != d or h_old != h or w_old != w:
-            deformation = deformation.permute(0, 4, 1, 2, 3)
+            deformation = deformation.permute(0, 4, 1, 2, 3) # (bs, d, h, w, 3) -> (bs, 3, d, h, w)
             deformation = F.interpolate(deformation, size=(d, h, w), mode='trilinear')
-            deformation = deformation.permute(0, 2, 3, 4, 1)
+            deformation = deformation.permute(0, 2, 3, 4, 1) # (bs, 3, d, h, w) -> (bs, d, h, w, 3)
         return F.grid_sample(inp, deformation)
+    
+    def warp_emotion_feature(self, feature, w_emotion):
+        bs, _, d, h, w = feature.shape
+        base_grid = mesh_grid(bs, d, h, w).to(feature.device)
+        motion_gird = norm_grid(base_grid + w_emotion) # (bs, d, h, w, 3)
+        _, d_old, h_old, w_old, _ = motion_gird.shape
 
-    def forward(self, source_image, kp_driving, kp_source):
+        if d_old != d or h_old != h or w_old != w:
+            motion_gird = motion_gird.permute(0, 4, 1, 2, 3) # (bs, d, h, w, 3) -> (bs, 3, d, h, w)
+            motion_gird = F.interpolate(motion_gird, size=(d, h, w), mode='trilinear')
+            motion_gird = motion_gird.permute(0, 2, 3, 4, 1) # (bs, 3, d, h, w) -> (bs, d, h, w, 3)
+        return F.grid_sample(feature, motion_gird, padding_mode='border', align_corners=True)
+
+    def forward(self, source_image, driving_image, kp_driving, kp_source):
+        output_dict = {}
+        #NOTE: feature volume for `driving` image
+        out = self.first(driving_image)
+        for i in range(len(self.down_blocks)):
+            out = self.down_blocks[i](out)
+        out = self.second(out)
+        bs, c, h, w = out.shape
+        # print(out.shape)
+        feature_3d = out.view(bs, self.reshape_channel, self.reshape_depth, h ,w) 
+        feature_3d = self.resblocks_3d(feature_3d)
+        output_dict['feature_3d_driving'] = feature_3d
+
         # Encoding (downsampling) part
         out = self.first(source_image)
         for i in range(len(self.down_blocks)):
@@ -77,9 +111,9 @@ class OcclusionAwareGenerator(nn.Module):
         # print(out.shape)
         feature_3d = out.view(bs, self.reshape_channel, self.reshape_depth, h ,w) 
         feature_3d = self.resblocks_3d(feature_3d)
+        output_dict['feature_3d_source'] = feature_3d
 
         # Transforming feature representation according to deformation and occlusion
-        output_dict = {}
         if self.dense_motion_network is not None:
             dense_motion = self.dense_motion_network(feature=feature_3d, kp_driving=kp_driving,
                                                      kp_source=kp_source)
@@ -93,6 +127,16 @@ class OcclusionAwareGenerator(nn.Module):
             deformation = dense_motion['deformation']
             out = self.deform_input(feature_3d, deformation)
 
+            # Expression warping after deformation from the keypoint-generated warping fields
+            if self.expression_encoder is not None: #TODO: Add the ternary loss, smoothness loss for the w_em, and optimize the expression encoder a d warper seperately (find a away)
+                expression = self.expression_encoder(driving_image)
+                output_dict_em = self.expression_warper(expression)
+                w_emotion = output_dict_em['w_em']
+                if 'occlusion_map' in output_dict_em:
+                    occlusion_map_em = output_dict_em['occlusion_map']
+                    output_dict['occlusion_map_em'] = occlusion_map_em
+                out = self.warp_emotion_feature(out, w_emotion)
+
             bs, c, d, h, w = out.shape
             out = out.view(bs, c*d, h, w)
             out = self.third(out)
@@ -102,6 +146,11 @@ class OcclusionAwareGenerator(nn.Module):
                 if out.shape[2] != occlusion_map.shape[2] or out.shape[3] != occlusion_map.shape[3]:
                     occlusion_map = F.interpolate(occlusion_map, size=out.shape[2:], mode='bilinear')
                 out = out * occlusion_map
+            
+            if occlusion_map_em is not None:
+                if out.shape[2] != occlusion_map_em.shape[2] or out.shape[3] != occlusion_map_em.shape[3]:
+                    occlusion_map_em = F.interpolate(occlusion_map_em, size=out.shape[2:], mode='bilinear')
+                out = out * occlusion_map_em
 
             # output_dict["deformed"] = self.deform_input(source_image, deformation)  # 3d deformation cannot deform 2d image
 

@@ -1,7 +1,7 @@
 from torch import nn
 import torch
 import torch.nn.functional as F
-from modules.util import AntiAliasInterpolation2d, make_coordinate_grid_2d
+from modules.util import AntiAliasInterpolation2d, make_coordinate_grid_2d, make_coordinate_grid_3d
 from torchvision import models
 import numpy as np
 from torch.autograd import grad
@@ -83,7 +83,7 @@ class Transform:
 
         if ('sigma_tps' in kwargs) and ('points_tps' in kwargs):
             self.tps = True
-            self.control_points = (make_coordinate_grid_2d((kwargs['points_tps'], kwargs['points_tps']), type=noise.type())).to(self.device)
+            self.control_points = make_coordinate_grid_2d((kwargs['points_tps'], kwargs['points_tps']), type=noise.type(), device=self.device)
             self.control_points = self.control_points.unsqueeze(0)
             self.control_params = torch.normal(mean=0,
                                                std=kwargs['sigma_tps'] * torch.ones([bs, 1, kwargs['points_tps'] ** 2]))
@@ -92,10 +92,10 @@ class Transform:
             self.tps = False
 
     def transform_frame(self, frame):
-        grid = (make_coordinate_grid_2d(frame.shape[2:], type=frame.type()).unsqueeze(0)).to(frame.device)
+        grid = make_coordinate_grid_2d(frame.shape[2:], type=frame.type(), device=frame.device).unsqueeze(0)
         grid = grid.view(1, frame.shape[2] * frame.shape[3], 2)
         grid = self.warp_coordinates(grid).view(self.bs, frame.shape[2], frame.shape[3], 2)
-        return F.grid_sample(frame, grid, padding_mode="reflection")
+        return F.grid_sample(frame, grid, padding_mode="reflection", align_corners=False)
 
     def warp_coordinates(self, coordinates):
         theta = self.theta.type(coordinates.type())
@@ -124,6 +124,85 @@ class Transform:
         jacobian = torch.cat([grad_x[0].unsqueeze(-2), grad_y[0].unsqueeze(-2)], dim=-2)
         return jacobian
 
+class Transform3D:
+    """
+    Random 3D transformations for equivariance constraints, including frame transformation.
+    """
+    def __init__(self, bs, device, **kwargs):
+        self.device = device
+        # Affine transformation for 3D
+        noise = torch.normal(mean=0, std=kwargs['sigma_affine'] * torch.ones([bs, 3, 4]))
+        self.theta = (noise + torch.eye(3, 4).view(1, 3, 4)).to(self.device)
+        self.bs = bs
+
+        # Thin Plate Spline (TPS) configuration
+        if ('sigma_tps' in kwargs) and ('points_tps' in kwargs):
+            self.tps = True
+            self.control_points = make_coordinate_grid_3d(
+                (kwargs['points_tps'], kwargs['points_tps'], kwargs['points_tps']),
+                type=noise.type(), device=self.device)
+            self.control_points = self.control_points.unsqueeze(0)
+            self.control_params = torch.normal(
+                mean=0, std=kwargs['sigma_tps'] * torch.ones([bs, 1, kwargs['points_tps'] ** 3]))
+            self.control_params = self.control_params.to(self.device)
+        else:
+            self.tps = False
+
+    def transform_frame_3d(self, frame):
+        """
+        Apply a homography derived from the 3D transformation to the 2D frame.
+        """
+        # Derive homography from the 3D affine matrix
+        H = self.theta[:, :2, :3]  # Extract the 2D projection of the 3D matrix
+        grid = make_coordinate_grid_2d(frame.shape[2:], type=frame.type(), device=frame.device).unsqueeze(0)
+        grid = grid.view(1, frame.shape[2] * frame.shape[3], 2)
+        
+        # Apply homography to the grid
+        H = H.unsqueeze(1)  # Shape: [bs, 1, 2, 3]
+        transformed_grid = torch.matmul(H[:, :, :, :2], grid.unsqueeze(-1)) + H[:, :, :, 2:]
+        transformed_grid = transformed_grid.squeeze(-1).view(self.bs, frame.shape[2], frame.shape[3], 2)
+        
+        return F.grid_sample(frame, transformed_grid, padding_mode="zeros", align_corners=False)
+
+
+    def warp_coordinates_2d(self, coordinates):
+        """
+        Warp 2D coordinates for frame transformation.
+        """
+        theta_2d = self.theta[:, :2, :3].type(coordinates.type())  # Use 2D slice of the 3D affine transformation
+        theta_2d = theta_2d.unsqueeze(1)  # Shape: [bs, 1, 2, 3]
+
+        # Apply affine transformation
+        transformed = torch.matmul(theta_2d[:, :, :, :2], coordinates.unsqueeze(-1)) + theta_2d[:, :, :, 2:]
+        transformed = transformed.squeeze(-1)
+        return transformed
+
+    def warp_coordinates(self, coordinates):
+        """
+        Warp 3D coordinates using affine and TPS transformations if enabled.
+        """
+        theta = self.theta.type(coordinates.type())
+        theta = theta.unsqueeze(1)  # Shape: [bs, 1, 3, 4]
+
+        # Apply affine transformation
+        transformed = torch.matmul(theta[:, :, :, :3], coordinates.unsqueeze(-1)) + theta[:, :, :, 3:]
+        transformed = transformed.squeeze(-1)
+
+        if self.tps:
+            control_points = self.control_points.type(coordinates.type())
+            control_params = self.control_params.type(coordinates.type())
+            distances = coordinates.view(coordinates.shape[0], -1, 1, 3) - control_points.view(1, 1, -1, 3)
+            distances = torch.norm(distances, dim=-1)
+
+            #NOTE: We have tried 2D RBF kernel with this as well (vox-256_01_12_24_13.37.52_device_1)
+            #NOTE: We have tried 3D RBF Kernel RBF(r)=r (result=distance) and it does not work at all! (vox-256_02_12_24_15.08.58_device_0)
+            result = distances ** 2
+            result = distances * control_params
+            result = result.sum(dim=2).view(self.bs, coordinates.shape[1], 1)
+            transformed = transformed + result
+
+        return transformed
+    
 
 def detach_kp(kp):
     return {key: value.detach() for key, value in kp.items()}
@@ -133,41 +212,11 @@ def headpose_pred_to_degree(pred):
     device = pred.device
     idx_tensor = [idx for idx in range(66)]
     idx_tensor = torch.FloatTensor(idx_tensor).to(device)
-    pred = F.softmax(pred)
+    pred = F.softmax(pred, dim=1)
     degree = torch.sum(pred*idx_tensor, axis=1) * 3 - 99
 
     return degree
 
-'''
-# beta version
-def get_rotation_matrix(yaw, pitch, roll):
-    yaw = yaw / 180 * 3.14
-    pitch = pitch / 180 * 3.14
-    roll = roll / 180 * 3.14
-
-    roll = roll.unsqueeze(1)
-    pitch = pitch.unsqueeze(1)
-    yaw = yaw.unsqueeze(1)
-
-    roll_mat = torch.cat([torch.ones_like(roll), torch.zeros_like(roll), torch.zeros_like(roll), 
-                          torch.zeros_like(roll), torch.cos(roll), -torch.sin(roll),
-                          torch.zeros_like(roll), torch.sin(roll), torch.cos(roll)], dim=1)
-    roll_mat = roll_mat.view(roll_mat.shape[0], 3, 3)
-
-    pitch_mat = torch.cat([torch.cos(pitch), torch.zeros_like(pitch), torch.sin(pitch), 
-                           torch.zeros_like(pitch), torch.ones_like(pitch), torch.zeros_like(pitch),
-                           -torch.sin(pitch), torch.zeros_like(pitch), torch.cos(pitch)], dim=1)
-    pitch_mat = pitch_mat.view(pitch_mat.shape[0], 3, 3)
-
-    yaw_mat = torch.cat([torch.cos(yaw), -torch.sin(yaw), torch.zeros_like(yaw),  
-                         torch.sin(yaw), torch.cos(yaw), torch.zeros_like(yaw),
-                         torch.zeros_like(yaw), torch.zeros_like(yaw), torch.ones_like(yaw)], dim=1)
-    yaw_mat = yaw_mat.view(yaw_mat.shape[0], 3, 3)
-
-    rot_mat = torch.einsum('bij,bjk,bkm->bim', roll_mat, pitch_mat, yaw_mat)
-
-    return rot_mat
-'''
 
 def get_rotation_matrix(yaw, pitch, roll):
     yaw = yaw / 180 * 3.14
@@ -197,7 +246,7 @@ def get_rotation_matrix(yaw, pitch, roll):
 
     return rot_mat
 
-def keypoint_transformation(kp_canonical, he, estimate_jacobian=True):
+def keypoint_transformation(kp_canonical, he, estimate_jacobian=True, add_expression=True):
     kp = kp_canonical['value']    # (bs, k, 3)
     yaw, pitch, roll = he['yaw'], he['pitch'], he['roll']
     t, exp = he['t'], he['exp']
@@ -216,8 +265,11 @@ def keypoint_transformation(kp_canonical, he, estimate_jacobian=True):
     kp_t = kp_rotated + t
 
     # add expression deviation 
-    exp = exp.view(exp.shape[0], -1, 3)
-    kp_transformed = kp_t + exp
+    if add_expression: #TODO: For experiments (facial expression improvement)
+        exp = exp.view(exp.shape[0], -1, 3)
+        kp_transformed = kp_t + exp
+    else:
+        kp_transformed = kp_t
 
     if estimate_jacobian:
         jacobian = kp_canonical['jacobian']   # (bs, k ,3, 3)
@@ -242,6 +294,8 @@ class GeneratorFullModel(torch.nn.Module):
         self.scales = train_params['scales']
         self.disc_scales = self.discriminator.scales
         self.pyramid = ImagePyramide(self.scales, generator.image_channel)
+        self.transform_hopenet =  transforms.Compose([transforms.Resize(size=(224, 224)),
+                                                     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
         if torch.cuda.is_available():
             self.pyramid = self.pyramid.cuda()
 
@@ -249,7 +303,7 @@ class GeneratorFullModel(torch.nn.Module):
 
         self.estimate_jacobian = estimate_jacobian
 
-        if sum(self.loss_weights['perceptual']) != 0:
+        if sum(self.loss_weights['perceptual']['vgg']) != 0:
             self.vgg = Vgg19()
             if torch.cuda.is_available() and device!=None:
                 self.vgg = self.vgg.to(device)
@@ -264,17 +318,18 @@ class GeneratorFullModel(torch.nn.Module):
                 self.hopenet.eval()
 
 
-    def forward(self, x):
+    def forward(self, x, add_expression=True):
         kp_canonical = self.kp_extractor(x['source'])     # {'value': value, 'jacobian': jacobian}   
+        kp_canonical_d = self.kp_extractor(x['driving'])
 
         he_source = self.he_estimator(x['source'])        # {'yaw': yaw, 'pitch': pitch, 'roll': roll, 't': t, 'exp': exp}
         he_driving = self.he_estimator(x['driving'])      # {'yaw': yaw, 'pitch': pitch, 'roll': roll, 't': t, 'exp': exp}
 
-        # {'value': value, 'jacobian': jacobian}
-        kp_source = keypoint_transformation(kp_canonical, he_source, self.estimate_jacobian)
-        kp_driving = keypoint_transformation(kp_canonical, he_driving, self.estimate_jacobian)
+        # {'value': value, 'jacobian': jacobian} #TODO: "add_expression" arg for experiments (facial expression improvement)
+        kp_source = keypoint_transformation(kp_canonical, he_source, self.estimate_jacobian, add_expression=add_expression)
+        kp_driving = keypoint_transformation(kp_canonical, he_driving, self.estimate_jacobian, add_expression=add_expression)
 
-        generated = self.generator(x['source'], kp_source=kp_source, kp_driving=kp_driving)
+        generated = self.generator(x['source'], x['driving'], kp_source=kp_source, kp_driving=kp_driving) #TODO: feature_3d volume both for xs and xd are added to the output
         generated.update({'kp_source': kp_source, 'kp_driving': kp_driving})
 
         loss_values = {}
@@ -282,7 +337,7 @@ class GeneratorFullModel(torch.nn.Module):
         pyramide_real = self.pyramid(x['driving'])
         pyramide_generated = self.pyramid(generated['prediction'])
 
-        if sum(self.loss_weights['perceptual']) != 0:
+        if sum(self.loss_weights['perceptual']['vgg']) != 0:
             value_total = 0
             for scale in self.scales:
                 x_vgg = self.vgg(pyramide_generated['prediction_' + str(scale)])
@@ -290,8 +345,12 @@ class GeneratorFullModel(torch.nn.Module):
 
                 for i, weight in enumerate(self.loss_weights['perceptual']):
                     value = torch.abs(x_vgg[i] - y_vgg[i].detach()).mean()
-                    value_total += self.loss_weights['perceptual'][i] * value
-            loss_values['perceptual'] = value_total
+                    value_total += self.loss_weights['perceptual']['vgg'][i] * value
+        #TODO: Ternary Loss
+        #NOTE: Right now, L1 loss
+        if self.loss_weights['perceptual']['l1'] != 0:
+            value_total += self.loss_weights['perceptual']['l1'] * (x['driving'] - generated['prediction']).abs().mean()
+            loss_values['perceptual'] = value_total / 2 # 2 is the number of perceptual losses, vgg and l1
 
         if self.loss_weights['generator_gan'] != 0:
             discriminator_maps_generated = self.discriminator(pyramide_generated)
@@ -320,9 +379,23 @@ class GeneratorFullModel(torch.nn.Module):
                         value_total += self.loss_weights['feature_matching'][i] * value
                     loss_values['feature_matching'] = value_total
 
+        #NOTE: for consistent expression-free 3D feature volumes
+        if self.loss_weights['feature_3d_consistency'] != 0: 
+            # MAE Loss between 3D feature volumes from the same ID (source and driving)
+            feature_3d_source = generated['feature_3d_source']
+            feature_3d_driving = generated['feature_3d_driving']
+            loss_values['feature_3d_consistency'] = self.loss_weights['feature_3d_consistency'] * torch.abs(feature_3d_source - feature_3d_driving).mean()
+
+        #NOTE: for consistent expression-free Rotation-free canonical keypoints
+        if self.loss_weights['canonicalkp_consistency'] != 0:
+            # MAE Loss between cacnonical keypoints from the same ID (source and driving)
+            loss_values['canonicalkp_consistency'] = self.loss_weights['canonicalkp_consistency'] * torch.abs(kp_canonical['value'] - kp_canonical_d['value']).mean()
+
         if (self.loss_weights['equivariance_value'] + self.loss_weights['equivariance_jacobian']) != 0:
             transform = Transform(x['driving'].shape[0], device=x['source'].device, **self.train_params['transform_params'])
             transformed_frame = transform.transform_frame(x['driving'])
+            # transform = Transform3D(x['driving'].shape[0], device=x['source'].device, **self.train_params['transform_params'])
+            # transformed_frame = transform.transform_frame_3d(x['driving'])
 
             transformed_he_driving = self.he_estimator(transformed_frame)
 
@@ -338,6 +411,13 @@ class GeneratorFullModel(torch.nn.Module):
                 transformed_kp_2d = transformed_kp['value'][:, :, :2]
                 value = torch.abs(kp_driving_2d - transform.warp_coordinates(transformed_kp_2d)).mean()
                 loss_values['equivariance_value'] = self.loss_weights['equivariance_value'] * value
+                #NOTE: 3D keypoint loss replaced
+                # kp_driving_3d = kp_driving['value']  # Full 3D keypoints [batch, num_keypoints, 3]
+                # transformed_kp_3d = transformed_kp['value']  # Full 3D keypoints [batch, num_keypoints, 3]
+
+                # # Compute warp directly in 3D
+                # warped_kp_3d = transform.warp_coordinates(transformed_kp_3d)
+                # value = torch.abs(kp_driving_3d - warped_kp_3d).mean()
 
             ## jacobian loss part
             if self.loss_weights['equivariance_jacobian'] != 0:
@@ -384,9 +464,7 @@ class GeneratorFullModel(torch.nn.Module):
             loss_values['keypoint'] = self.loss_weights['keypoint'] * value_total
 
         if self.loss_weights['headpose'] != 0:
-            transform_hopenet =  transforms.Compose([transforms.Resize(size=(224, 224)),
-                                                     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
-            driving_224 = transform_hopenet(x['driving'])
+            driving_224 = self.transform_hopenet(x['driving']) # Need the image to be of shape 224x224 due to hopenet
 
             yaw_gt, pitch_gt, roll_gt = self.hopenet(driving_224)
             yaw_gt = headpose_pred_to_degree(yaw_gt)
@@ -401,6 +479,7 @@ class GeneratorFullModel(torch.nn.Module):
             value = torch.abs(yaw - yaw_gt).mean() + torch.abs(pitch - pitch_gt).mean() + torch.abs(roll - roll_gt).mean()
             loss_values['headpose'] = self.loss_weights['headpose'] * value
 
+        #TODO: Should use a better way to handle this expression loss. Just minimizing a value not a good idea.
         if self.loss_weights['expression'] != 0:
             value = torch.norm(he_driving['exp'], p=1, dim=-1).mean()
             loss_values['expression'] = self.loss_weights['expression'] * value
@@ -422,8 +501,7 @@ class DiscriminatorFullModel(torch.nn.Module):
         self.scales = self.discriminator.scales
         self.device = device
         self.pyramid = ImagePyramide(self.scales, generator.image_channel)
-        if torch.cuda.is_available():
-            self.pyramid = self.pyramid.to(self.device)
+        self.pyramid = self.pyramid.to(self.device)
 
         self.loss_weights = train_params['loss_weights']
 

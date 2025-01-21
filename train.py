@@ -14,10 +14,10 @@ def train(config, generator, discriminator, kp_detector, he_estimator, checkpoin
     train_params = config['train_params']
     device = f"cuda:{device_id}"
 
-    optimizer_generator = torch.optim.Adam(generator.parameters(), lr=train_params['lr_generator'], betas=(0.5, 0.999))
-    optimizer_discriminator = torch.optim.Adam(discriminator.parameters(), lr=train_params['lr_discriminator'], betas=(0.5, 0.999))
-    optimizer_kp_detector = torch.optim.Adam(kp_detector.parameters(), lr=train_params['lr_kp_detector'], betas=(0.5, 0.999))
-    optimizer_he_estimator = torch.optim.Adam(he_estimator.parameters(), lr=train_params['lr_he_estimator'], betas=(0.5, 0.999))
+    optimizer_generator = torch.optim.AdamW(generator.parameters(), lr=train_params['lr_generator'], betas=(0.5, 0.999))
+    optimizer_discriminator = torch.optim.AdamW(discriminator.parameters(), lr=train_params['lr_discriminator'], betas=(0.5, 0.999))
+    optimizer_kp_detector = torch.optim.AdamW(kp_detector.parameters(), lr=train_params['lr_kp_detector'], betas=(0.5, 0.999))
+    optimizer_he_estimator = torch.optim.AdamW(he_estimator.parameters(), lr=train_params['lr_he_estimator'], betas=(0.5, 0.999))
 
     if checkpoint is not None:
         start_epoch, global_epoch = Logger.load_cpk(checkpoint, generator, discriminator, kp_detector, he_estimator,
@@ -51,6 +51,7 @@ def train(config, generator, discriminator, kp_detector, he_estimator, checkpoin
             for x in tqdm(dataloader):
                 global_epoch += 1
                 x = {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in x.items()}
+                generator_full.train()
                 losses_generator, generated = generator_full(x)
 
                 loss_values = [val.mean() for val in losses_generator.values()]
@@ -81,10 +82,8 @@ def train(config, generator, discriminator, kp_detector, he_estimator, checkpoin
                 logger.log_iter(losses=losses)
                 logger.log_scores(logger.names)
                 # Tensorboard TODO: Add more metrics like psnr, ssim, etc.
-                if writer!=None:
-                    for key, value in losses.items():
-                        writer.add_scalar(f'train/{key}', value, global_epoch)
-                        writer.flush()
+                if writer is not None:
+                    logger.log_tensorboard('train', losses, generated['prediction'].detach(), x['driving'].detach(), global_epoch)
 
             scheduler_generator.step()
             scheduler_discriminator.step()
@@ -101,18 +100,18 @@ def train(config, generator, discriminator, kp_detector, he_estimator, checkpoin
                                      'optimizer_kp_detector': optimizer_kp_detector,
                                      'optimizer_he_estimator': optimizer_he_estimator}, inp=x, out=generated)
         
-        # Validation
-        run_validation(generator, val_loader, device, epoch, writer)
+            # Validation
+            run_validation(generator_full, val_loader, device, epoch, logger, writer)
             
 
-def run_validation(generator, val_loader, device, epoch, writer) -> None:
+@torch.no_grad()
+def run_validation(generator_full, val_loader, device, epoch, logger, writer=None) -> None:
     for vaL_batch in val_loader:
         vaL_batch = {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in vaL_batch.items()}
-        losses_generator, generated = generator(vaL_batch)
+        generator_full.eval()
+        losses_generator, generated = generator_full(vaL_batch)
 
         losses = {key: value.mean().detach().data.cpu().numpy() for key, value in losses_generator.items()}
         # Tensorboard TODO: Add more metrics like psnr, ssim, etc.
-        if writer!=None:
-            for key, value in losses.items():
-                writer.add_scalar(f'val/{key}', value, epoch)
-                writer.flush()
+        if writer is not None:
+            logger.log_tensorboard('val', losses, generated['prediction'].detach(), vaL_batch['driving'].detach(), epoch)

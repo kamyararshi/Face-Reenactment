@@ -5,10 +5,13 @@ from torch.distributed import destroy_process_group
 import imageio
 
 import os
+from typing import Dict
 from skimage.draw import circle
 
 import matplotlib.pyplot as plt
 import collections
+from torchmetrics.functional.image import structural_similarity_index_measure as ssim
+from torchmetrics.functional.image import peak_signal_noise_ratio as psnr
 
 
 class Logger:
@@ -30,6 +33,7 @@ class Logger:
         self.writer = writer
         self.ddp = ddp
 
+
     def log_scores(self, loss_names):
         loss_mean = np.array(self.loss_list).mean(axis=0)
 
@@ -40,6 +44,23 @@ class Logger:
         self.loss_list = []
         self.log_file.flush()
 
+    def log_tensorboard(self, state: str, losses: dict, generated: torch.tensor, gt: torch.tensor, global_epoch: int) -> None:
+        for key, value in losses.items():
+            self.writer.add_scalar(f'{state}/{key}', value, global_epoch)
+        
+        metrics = self.compute_metrics(generated, gt)
+        # Log scalar metrics
+        for metric, value in metrics.items():
+            self.writer.add_scalar(f'{state}/Metric/{metric}', value, global_epoch)
+        self.writer.flush()
+        
+    def compute_metrics(self, generated: torch.Tensor, gt: torch.Tensor) -> Dict[str, float]:
+        metrics = {
+            "SSIM": ssim(generated, gt).item(),
+            "PSNR": psnr(generated, gt).item(),
+        }
+        return metrics
+    
     def visualize_rec(self, inp, out):
         image = self.visualizer.visualize(inp['driving'], inp['source'], out)
         # source, transformed, driving, pred, occlusion, mask0(no color), mask1, mask2, mask3, ..., mask15 
@@ -57,9 +78,42 @@ class Logger:
             torch.save(cpk, cpk_path)
 
     @staticmethod
+    def move_optimizer_states(optimizer, device):
+        """
+        Moves all state tensors in an optimizer to the specified device.
+
+        Args:
+            optimizer (torch.optim.Optimizer): The optimizer whose state needs to be moved.
+            device (str or torch.device): The device to move the state tensors to.
+        """
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(device)
+
+    @staticmethod
     def load_cpk(checkpoint_path, generator=None, discriminator=None, kp_detector=None, he_estimator=None,
-                 optimizer_generator=None, optimizer_discriminator=None, optimizer_kp_detector=None, optimizer_he_estimator=None, map_location='cpu'):
+                optimizer_generator=None, optimizer_discriminator=None, optimizer_kp_detector=None, optimizer_he_estimator=None,
+                rank=None):
+        """
+        Loads a checkpoint and maps it to the correct device for DDP.
+
+        Args:
+            checkpoint_path (str): Path to the checkpoint file.
+            generator, discriminator, kp_detector, he_estimator: Model components to load.
+            optimizer_generator, optimizer_discriminator, optimizer_kp_detector, optimizer_he_estimator: Optimizers to load.
+            map_location (str): Device to map the checkpoint to. Default is None.
+            rank (int): Rank of the current process. Used to map devices in DDP.
+
+        Returns:
+            tuple: epoch and global_epoch from the checkpoint.
+        """
+        if rank is not None:
+            map_location = f"cuda:{rank}"  # Map checkpoint to the rank-specific GPU
+
         checkpoint = torch.load(checkpoint_path, map_location=map_location)
+
+        # Load models
         if generator is not None:
             generator.load_state_dict(checkpoint['generator'])
         if kp_detector is not None:
@@ -68,22 +122,33 @@ class Logger:
             he_estimator.load_state_dict(checkpoint['he_estimator'])
         if discriminator is not None:
             try:
-               discriminator.load_state_dict(checkpoint['discriminator'])
-            except:
-               print ('No discriminator in the state-dict. Dicriminator will be randomly initialized')
+                discriminator.load_state_dict(checkpoint['discriminator'])
+            except KeyError:
+                print('No discriminator in the state-dict. Discriminator will be randomly initialized.')
+
+        # Load optimizers and move states
         if optimizer_generator is not None:
             optimizer_generator.load_state_dict(checkpoint['optimizer_generator'])
+            Logger.move_optimizer_states(optimizer_generator, map_location)
+
         if optimizer_discriminator is not None:
             try:
                 optimizer_discriminator.load_state_dict(checkpoint['optimizer_discriminator'])
-            except RuntimeError as e:
-                print ('No discriminator optimizer in the state-dict. Optimizer will be not initialized')
+                Logger.move_optimizer_states(optimizer_discriminator, map_location)
+            except KeyError:
+                print('No discriminator optimizer in the state-dict. Optimizer will not be initialized.')
+
         if optimizer_kp_detector is not None:
             optimizer_kp_detector.load_state_dict(checkpoint['optimizer_kp_detector'])
+            Logger.move_optimizer_states(optimizer_kp_detector, map_location)
+
         if optimizer_he_estimator is not None:
             optimizer_he_estimator.load_state_dict(checkpoint['optimizer_he_estimator'])
+            Logger.move_optimizer_states(optimizer_he_estimator, map_location)
 
+        # Return epoch and global epoch for resuming training
         return checkpoint['epoch'], checkpoint['global_epoch']
+
 
     def __enter__(self):
         return self

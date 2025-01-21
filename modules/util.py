@@ -83,6 +83,19 @@ def make_coordinate_grid(spatial_size, type, device):
 
     return meshed
 
+def mesh_grid(bs, d, h, w):
+    x = torch.arange(w).view(1, 1, 1, 1, w).expand(bs, 1, d, h, w)
+    y = torch.arange(h).view(1, 1, 1, h, 1).expand(bs, 1, d, h, w)
+    z = torch.arange(d).view(1, 1, d, 1, 1).expand(bs, 1, d, h, w)
+    base_grid = torch.cat((x, y, z), 1).float()
+    return base_grid
+
+def norm_grid(grid):
+    _, _, d, h, w = grid.shape
+    grid[:, 0, :, :, :] = grid[:, 0, :, :, :] / (w - 1) * 2 - 1
+    grid[:, 1, :, :, :] = grid[:, 1, :, :, :] / (h - 1) * 2 - 1
+    grid[:, 2, :, :, :] = grid[:, 2, :, :, :] / (d - 1) * 2 - 1
+    return grid.permute(0, 2, 3, 4, 1)
 
 class ResBottleneck(nn.Module):
     def __init__(self, in_features, stride):

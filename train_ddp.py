@@ -1,3 +1,4 @@
+import torch.optim
 from torch.utils.data import Dataset
 import torch.nn as nn
 from tqdm import trange, tqdm
@@ -15,29 +16,28 @@ from logger import Logger
 from modules.model import GeneratorFullModel, DiscriminatorFullModel
 from frames_dataset import DatasetRepeater
 
-def ddp_setup(rank: int, world_size: int, backend: str='nccl') -> None:
+def ddp_setup(rank: int, world_size: int, backend: str='nccl', MASTER_ADDR: str='localhost', MASTER_PORT: str='12355') -> None:
     import os
-    os.environ['MASTER_ADDR'] = 'localhost' # Change this to the IP of the master node
-    os.environ['MASTER_PORT'] = '12355' # Random free port
+    os.environ['MASTER_ADDR'] = MASTER_ADDR # Change this to the IP of the master node
+    os.environ['MASTER_PORT'] = MASTER_PORT # Random free port
     init_process_group(backend, rank=rank, world_size=world_size)
     
 def train(rank: int, world_size: int, config: dict,
             generator: nn.Module, discriminator: nn.Module, kp_detector: nn.Module, he_estimator: nn.Module,
             checkpoint: str, log_dir: str, dataset: Dataset, val_dataset: Dataset, writer: bool=True) -> None:
     train_params = config['train_params']
-    map_location = f"cuda:{rank}"
     device = rank
     ddp_setup(rank=device, world_size=world_size)
 
-    optimizer_generator = torch.optim.Adam(generator.parameters(), lr=train_params['lr_generator'], betas=(0.5, 0.999))
-    optimizer_discriminator = torch.optim.Adam(discriminator.parameters(), lr=train_params['lr_discriminator'], betas=(0.5, 0.999))
-    optimizer_kp_detector = torch.optim.Adam(kp_detector.parameters(), lr=train_params['lr_kp_detector'], betas=(0.5, 0.999))
-    optimizer_he_estimator = torch.optim.Adam(he_estimator.parameters(), lr=train_params['lr_he_estimator'], betas=(0.5, 0.999))
+    optimizer_generator = torch.optim.AdamW(generator.parameters(), lr=train_params['lr_generator'], betas=(0.5, 0.999))
+    optimizer_discriminator = torch.optim.AdamW(discriminator.parameters(), lr=train_params['lr_discriminator'], betas=(0.5, 0.999))
+    optimizer_kp_detector = torch.optim.AdamW(kp_detector.parameters(), lr=train_params['lr_kp_detector'], betas=(0.5, 0.999))
+    optimizer_he_estimator = torch.optim.AdamW(he_estimator.parameters(), lr=train_params['lr_he_estimator'], betas=(0.5, 0.999))
 
-    # TODO: Weight loading for DDP is not Worling yet
+    # TODO: Weight loading for DDP is not Working yet
     if checkpoint is not None:
         start_epoch, global_epoch = Logger.load_cpk(checkpoint, generator, discriminator, kp_detector, he_estimator,
-                                      optimizer_generator, optimizer_discriminator, optimizer_kp_detector, optimizer_he_estimator, map_location)
+                                      optimizer_generator, optimizer_discriminator, optimizer_kp_detector, optimizer_he_estimator, rank=rank)
     else:
         start_epoch, global_epoch = 0, 0
 
@@ -61,14 +61,15 @@ def train(rank: int, world_size: int, config: dict,
     discriminator_full = DDP(discriminator_full, device_ids=[device], find_unused_parameters=True) # Wrap the model with DDP
 
     # Tensorboard
-    writer = SummaryWriter(f'{log_dir}/runs/') if writer and get_rank()==0 else None
+    writer = SummaryWriter(f'{log_dir}/runs/') if writer and rank==0 else None
 
     with Logger(log_dir=log_dir, visualizer_params=config['visualizer_params'], checkpoint_freq=train_params['checkpoint_freq'], writer=writer, ddp=True) as logger:
         for epoch in trange(start_epoch, train_params['num_epochs']):
             for x in tqdm(dataloader):
                 global_epoch += 1
                 x = {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in x.items()}
-                losses_generator, generated = generator_full(x)
+                generator_full.train()
+                losses_generator, generated = generator_full(x, add_expression=False) #TODO: add_expressions=False is used to avoid the expression loss
 
                 loss_values = [val.mean() for val in losses_generator.values()]
                 loss = sum(loss_values)
@@ -95,13 +96,12 @@ def train(rank: int, world_size: int, config: dict,
 
                 losses_generator.update(losses_discriminator)
                 losses = {key: value.mean().detach().data.cpu().numpy() for key, value in losses_generator.items()}
-                logger.log_iter(losses=losses)
-                logger.log_scores(logger.names)
-                # Tensorboard TODO: Add more metrics like psnr, ssim, etc.
-                if writer!=None:
-                    for key, value in losses.items():
-                        writer.add_scalar(f'train/{key}', value, global_epoch)
-                        writer.flush()
+                if rank == 0: # Only the master node logs the losses' scores
+                    logger.log_iter(losses=losses)
+                    logger.log_scores(logger.names)
+                    # Tensorboard TODO: Add more metrics like psnr, ssim, etc.
+                    if writer is not None:
+                        logger.log_tensorboard('train', losses, generated['prediction'].detach(), x['driving'].detach(), global_epoch)
 
             scheduler_generator.step()
             scheduler_discriminator.step()
@@ -119,20 +119,20 @@ def train(rank: int, world_size: int, config: dict,
                                         'optimizer_kp_detector': optimizer_kp_detector,
                                         'optimizer_he_estimator': optimizer_he_estimator}, inp=x, out=generated)
         
-        # Validation
-        run_validation(generator, val_loader, device, epoch, writer)
+                # Validation
+                run_validation(generator_full, val_loader, device, epoch, logger, writer)
 
     destroy_process_group()
             
 
-def run_validation(generator, val_loader, device, epoch, writer) -> None:
+@torch.no_grad()
+def run_validation(generator_full, val_loader, device, epoch, logger, writer=None) -> None:
     for vaL_batch in val_loader:
         vaL_batch = {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in vaL_batch.items()}
-        losses_generator, generated = generator(vaL_batch)
+        generator_full.eval()
+        losses_generator, generated = generator_full(vaL_batch, add_expression=False)
 
         losses = {key: value.mean().detach().data.cpu().numpy() for key, value in losses_generator.items()}
         # Tensorboard TODO: Add more metrics like psnr, ssim, etc.
-        if writer!=None:
-            for key, value in losses.items():
-                writer.add_scalar(f'val/{key}', value, epoch)
-                writer.flush()
+        if writer is not None:
+            logger.log_tensorboard('val', losses, generated['prediction'].detach(), vaL_batch['driving'].detach(), epoch)

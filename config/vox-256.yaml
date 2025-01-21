@@ -49,6 +49,9 @@ model_params:
       # reshape_channel: 32
       reshape_depth: 16
       compress: 4
+    expression_enc_params:
+      model: 'resnet18' #'resnet34'
+      num_classes: 128
   discriminator_params:
     scales: [1]
     block_expansion: 32                 
@@ -57,15 +60,15 @@ model_params:
     sn: True
 
 train_params:
-  num_epochs: 300
+  num_epochs: 100
   num_repeats: 1
-  epoch_milestones: [180,]
+  epoch_milestones: [60,]
   lr_generator: 2.0e-4
   lr_discriminator: 2.0e-4
   lr_kp_detector: 2.0e-4
   lr_he_estimator: 2.0e-4
   gan_mode: 'hinge'    # hinge or ls
-  batch_size: 16
+  batch_size: 8
   scales: [1, 0.5, 0.25, 0.125]
   checkpoint_freq: 10
   hopenet_snapshot: 'config/checkpoints/hopenet_robust_alpha1.pkl'
@@ -77,12 +80,16 @@ train_params:
     generator_gan: 1                  
     discriminator_gan: 1
     feature_matching: [10, 10, 10, 10]
-    perceptual: [10, 10, 10, 10, 10]
+    perceptual: 
+      vgg: [10, 10, 10, 10, 10]
+      l1: 10
+    canonicalkp_consistency: 5
+    feature_3d_consistency: 5
     equivariance_value: 10
     equivariance_jacobian: 0    # 10
     keypoint: 10
     headpose: 20
-    expression: 5
+    expression: 0    #TODO: For experiments (facial expression improvement)
 
 visualizer_params:
   kp_size: 5

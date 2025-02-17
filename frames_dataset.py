@@ -12,6 +12,7 @@ from torch.utils.data import Dataset
 import pandas as pd
 from augmentation import AllAugmentationTransform
 import glob
+import re
 
 
 def read_video(name, frame_shape):
@@ -155,13 +156,17 @@ class AllFrames(Dataset):
         ])
         
         self.len = len(self.all)
+        self.pattern = r"/([^/]+\.mp4)/"
 
     def __len__(self):
         return self.len
 
     def __getitem__(self, idx):
-        img = Image.open(self.all[idx])
-        return self.pre_transform(img)
+        img_path = self.all[idx]
+        img = Image.open(img_path)
+        # Regular expression to match strings between '/' that end with '.mp4'
+        cls = re.findall(self.pattern, self.all[idx])[0]
+        return self.pre_transform(img), cls, img_path
 
 class FramesDataset(Dataset):
     """

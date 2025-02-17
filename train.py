@@ -10,7 +10,7 @@ from logger import Logger
 from modules.model import GeneratorFullModel, DiscriminatorFullModel
 from frames_dataset import DatasetRepeater
 
-def train(config, generator, discriminator, kp_detector, he_estimator, checkpoint, log_dir, dataset, val_dataset, device_id, writer=True) -> None:
+def train(config, generator, discriminator, kp_detector, he_estimator, opt, log_dir, dataset, val_dataset, device_id, writer=True) -> None:
     train_params = config['train_params']
     device = f"cuda:{device_id}"
 
@@ -19,8 +19,8 @@ def train(config, generator, discriminator, kp_detector, he_estimator, checkpoin
     optimizer_kp_detector = torch.optim.AdamW(kp_detector.parameters(), lr=train_params['lr_kp_detector'], betas=(0.5, 0.999))
     optimizer_he_estimator = torch.optim.AdamW(he_estimator.parameters(), lr=train_params['lr_he_estimator'], betas=(0.5, 0.999))
 
-    if checkpoint is not None:
-        start_epoch, global_epoch = Logger.load_cpk(checkpoint, generator, discriminator, kp_detector, he_estimator,
+    if opt.checkpoint is not None:
+        start_epoch, global_epoch = Logger.load_cpk(opt.checkpoint, generator, discriminator, kp_detector, he_estimator,
                                       optimizer_generator, optimizer_discriminator, optimizer_kp_detector, optimizer_he_estimator, device)
     else:
         start_epoch, global_epoch = 0, 0
@@ -34,17 +34,22 @@ def train(config, generator, discriminator, kp_detector, he_estimator, checkpoin
     scheduler_he_estimator = MultiStepLR(optimizer_he_estimator, train_params['epoch_milestones'], gamma=0.1,
                                         last_epoch=-1 + start_epoch * (train_params['lr_kp_detector'] != 0))
 
-    if 'num_repeats' in train_params or train_params['num_repeats'] != 1:
+    # Use the DatasetRepeater if required.
+    if 'num_repeats' in train_params and train_params['num_repeats'] != 1:
         dataset = DatasetRepeater(dataset, train_params['num_repeats'])
-    dataloader = DataLoader(dataset, batch_size=train_params['batch_size'], shuffle=True, num_workers=16, drop_last=True)
+    # Update dataloader to match the DDP script (no sampler, shuffle=False, drop_last=False)
+    dataloader = DataLoader(dataset, batch_size=train_params['batch_size'], shuffle=False, num_workers=16, drop_last=False)
     val_loader = DataLoader(val_dataset, batch_size=train_params['batch_size'], shuffle=False, num_workers=16)
 
-    generator_full = GeneratorFullModel(kp_detector, he_estimator, generator, discriminator, train_params, estimate_jacobian=config['model_params']['common_params']['estimate_jacobian'], device=device)
-    discriminator_full = DiscriminatorFullModel(kp_detector, generator, discriminator, train_params, device=device)
+    # Move models to device (as done in the DDP script before wrapping)
+    generator_full = GeneratorFullModel(
+        kp_detector, he_estimator, generator, discriminator, train_params,
+        estimate_jacobian=config['model_params']['common_params']['estimate_jacobian'],
+        device=device).to(device)
+    discriminator_full = DiscriminatorFullModel(kp_detector, generator, discriminator, train_params, device=device).to(device)
 
-    # Tensorboard
+    # Tensorboard writer
     writer = SummaryWriter(f'{log_dir}/runs/') if writer else None
-
 
     with Logger(log_dir=log_dir, visualizer_params=config['visualizer_params'], checkpoint_freq=train_params['checkpoint_freq'], writer=writer, ddp=False) as logger:
         for epoch in trange(start_epoch, train_params['num_epochs']):
@@ -52,7 +57,8 @@ def train(config, generator, discriminator, kp_detector, he_estimator, checkpoin
                 global_epoch += 1
                 x = {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in x.items()}
                 generator_full.train()
-                losses_generator, generated = generator_full(x)
+                # Use the same forward call as in DDP.
+                losses_generator, generated = generator_full(x, add_expression=opt.add_expr, rec_driving=opt.rec_driv)
 
                 loss_values = [val.mean() for val in losses_generator.values()]
                 loss = sum(loss_values)
@@ -81,7 +87,7 @@ def train(config, generator, discriminator, kp_detector, he_estimator, checkpoin
                 losses = {key: value.mean().detach().data.cpu().numpy() for key, value in losses_generator.items()}
                 logger.log_iter(losses=losses)
                 logger.log_scores(logger.names)
-                # Tensorboard TODO: Add more metrics like psnr, ssim, etc.
+                # Tensorboard: add more metrics like psnr, ssim, etc.
                 if writer is not None:
                     logger.log_tensorboard('train', losses, generated['prediction'].detach(), x['driving'].detach(), global_epoch)
 
@@ -91,17 +97,17 @@ def train(config, generator, discriminator, kp_detector, he_estimator, checkpoin
             scheduler_he_estimator.step()
             
             logger.log_epoch(epoch, global_epoch,
-                                 {'generator': generator,
-                                     'discriminator': discriminator,
-                                     'kp_detector': kp_detector,
-                                     'he_estimator': he_estimator,
-                                     'optimizer_generator': optimizer_generator,
-                                     'optimizer_discriminator': optimizer_discriminator,
-                                     'optimizer_kp_detector': optimizer_kp_detector,
-                                     'optimizer_he_estimator': optimizer_he_estimator}, inp=x, out=generated)
+                             {'generator': generator,
+                              'discriminator': discriminator,
+                              'kp_detector': kp_detector,
+                              'he_estimator': he_estimator,
+                              'optimizer_generator': optimizer_generator,
+                              'optimizer_discriminator': optimizer_discriminator,
+                              'optimizer_kp_detector': optimizer_kp_detector,
+                              'optimizer_he_estimator': optimizer_he_estimator}, inp=x, out=generated)
         
-            # Validation
-            run_validation(generator_full, val_loader, device, epoch, logger, writer)
+            # Validation: use the same forward call as in DDP.
+            _ = run_validation(generator_full, val_loader, device, epoch, logger, writer)
             
 
 @torch.no_grad()
@@ -109,9 +115,12 @@ def run_validation(generator_full, val_loader, device, epoch, logger, writer=Non
     for vaL_batch in val_loader:
         vaL_batch = {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in vaL_batch.items()}
         generator_full.eval()
-        losses_generator, generated = generator_full(vaL_batch)
+        # Use the same validation forward call as in DDP.
+        losses_generator, generated = generator_full(vaL_batch, add_expression=False)
 
         losses = {key: value.mean().detach().data.cpu().numpy() for key, value in losses_generator.items()}
-        # Tensorboard TODO: Add more metrics like psnr, ssim, etc.
+        # Tensorboard: add more metrics like psnr, ssim, etc.
         if writer is not None:
             logger.log_tensorboard('val', losses, generated['prediction'].detach(), vaL_batch['driving'].detach(), epoch)
+
+    return vaL_batch, generated

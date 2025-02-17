@@ -32,8 +32,12 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", default=None, help="path to checkpoint to restore")
     parser.add_argument("--device_ids", default="0", type=lambda x: list(map(int, x.split(','))),
                         help="Names of the devices comma separated.")
+    parser.add_argument("--no_expr", dest="add_expr", action="store_false", help="Include expression deformation in keypoints")
+    parser.add_argument("--rec_driv", dest="rec_driv", action="store_true", help="Reconstruct the driving feature volume")
     parser.add_argument("--verbose", dest="verbose", action="store_true", help="Print model architecture")
     parser.set_defaults(verbose=False)
+    parser.set_defaults(add_expr=True)
+    parser.set_defaults(rec_driv=False)
 
     opt = parser.parse_args()
     with open(opt.config) as f:
@@ -99,9 +103,9 @@ if __name__ == "__main__":
             import torch.multiprocessing as mp
             print("Training with DDP...")
             world_size = len(opt.device_ids)
-            mp.spawn(train, args=(world_size, config, generator, discriminator, kp_detector, he_estimator, opt.checkpoint, log_dir, dataset, val_dataset),
+            mp.spawn(train, args=(world_size, config, generator, discriminator, kp_detector, he_estimator, opt, log_dir, dataset, val_dataset),
                      nprocs=world_size, join=True)
         else:
             from train import train
             print("Training with Single GPU...")
-            train(config, generator, discriminator, kp_detector, he_estimator, opt.checkpoint, log_dir, dataset, val_dataset, device_id)
+            train(config, generator, discriminator, kp_detector, he_estimator, opt, log_dir, dataset, val_dataset, device_id)

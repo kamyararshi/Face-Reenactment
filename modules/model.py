@@ -318,7 +318,7 @@ class GeneratorFullModel(torch.nn.Module):
                 self.hopenet.eval()
 
 
-    def forward(self, x, add_expression=True):
+    def forward(self, x, add_expression=True, rec_driving=False):
         kp_canonical = self.kp_extractor(x['source'])     # {'value': value, 'jacobian': jacobian}   
         kp_canonical_d = self.kp_extractor(x['driving'])
 
@@ -329,7 +329,7 @@ class GeneratorFullModel(torch.nn.Module):
         kp_source = keypoint_transformation(kp_canonical, he_source, self.estimate_jacobian, add_expression=add_expression)
         kp_driving = keypoint_transformation(kp_canonical, he_driving, self.estimate_jacobian, add_expression=add_expression)
 
-        generated = self.generator(x['source'], x['driving'], kp_source=kp_source, kp_driving=kp_driving) #TODO: feature_3d volume both for xs and xd are added to the output
+        generated = self.generator(x['source'], x['driving'], kp_source=kp_source, kp_driving=kp_driving, rec_driving=rec_driving) #TODO: feature_3d volume both for xs and xd are added to the output
         generated.update({'kp_source': kp_source, 'kp_driving': kp_driving})
 
         loss_values = {}
@@ -346,11 +346,12 @@ class GeneratorFullModel(torch.nn.Module):
                 for i, weight in enumerate(self.loss_weights['perceptual']):
                     value = torch.abs(x_vgg[i] - y_vgg[i].detach()).mean()
                     value_total += self.loss_weights['perceptual']['vgg'][i] * value
+            loss_values['perceptual'] = value_total
         #TODO: Ternary Loss
         #NOTE: Right now, L1 loss
         if self.loss_weights['perceptual']['l1'] != 0:
-            value_total += self.loss_weights['perceptual']['l1'] * (x['driving'] - generated['prediction']).abs().mean()
-            loss_values['perceptual'] = value_total / 2 # 2 is the number of perceptual losses, vgg and l1
+            loss_values['perceptual'] += self.loss_weights['perceptual']['l1'] * (x['driving'] - generated['prediction']).abs().mean()
+            
 
         if self.loss_weights['generator_gan'] != 0:
             discriminator_maps_generated = self.discriminator(pyramide_generated)
@@ -379,12 +380,6 @@ class GeneratorFullModel(torch.nn.Module):
                         value_total += self.loss_weights['feature_matching'][i] * value
                     loss_values['feature_matching'] = value_total
 
-        #NOTE: for consistent expression-free 3D feature volumes
-        if self.loss_weights['feature_3d_consistency'] != 0: 
-            # MAE Loss between 3D feature volumes from the same ID (source and driving)
-            feature_3d_source = generated['feature_3d_source']
-            feature_3d_driving = generated['feature_3d_driving']
-            loss_values['feature_3d_consistency'] = self.loss_weights['feature_3d_consistency'] * torch.abs(feature_3d_source - feature_3d_driving).mean()
 
         #NOTE: for consistent expression-free Rotation-free canonical keypoints
         if self.loss_weights['canonicalkp_consistency'] != 0:
@@ -480,7 +475,7 @@ class GeneratorFullModel(torch.nn.Module):
             loss_values['headpose'] = self.loss_weights['headpose'] * value
 
         #TODO: Should use a better way to handle this expression loss. Just minimizing a value not a good idea.
-        if self.loss_weights['expression'] != 0:
+        if self.loss_weights['expression'] != 0 and add_expression:
             value = torch.norm(he_driving['exp'], p=1, dim=-1).mean()
             loss_values['expression'] = self.loss_weights['expression'] * value
 

@@ -24,7 +24,7 @@ def ddp_setup(rank: int, world_size: int, backend: str='nccl', MASTER_ADDR: str=
     
 def train(rank: int, world_size: int, config: dict,
             generator: nn.Module, discriminator: nn.Module, kp_detector: nn.Module, he_estimator: nn.Module,
-            checkpoint: str, log_dir: str, dataset: Dataset, val_dataset: Dataset, writer: bool=True) -> None:
+            opt: dict, log_dir: str, dataset: Dataset, val_dataset: Dataset, writer: bool=True) -> None:
     train_params = config['train_params']
     device = rank
     ddp_setup(rank=device, world_size=world_size)
@@ -35,8 +35,8 @@ def train(rank: int, world_size: int, config: dict,
     optimizer_he_estimator = torch.optim.AdamW(he_estimator.parameters(), lr=train_params['lr_he_estimator'], betas=(0.5, 0.999))
 
     # TODO: Weight loading for DDP is not Working yet
-    if checkpoint is not None:
-        start_epoch, global_epoch = Logger.load_cpk(checkpoint, generator, discriminator, kp_detector, he_estimator,
+    if opt.checkpoint is not None:
+        start_epoch, global_epoch = Logger.load_cpk(opt.checkpoint, generator, discriminator, kp_detector, he_estimator,
                                       optimizer_generator, optimizer_discriminator, optimizer_kp_detector, optimizer_he_estimator, rank=rank)
     else:
         start_epoch, global_epoch = 0, 0
@@ -69,7 +69,7 @@ def train(rank: int, world_size: int, config: dict,
                 global_epoch += 1
                 x = {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in x.items()}
                 generator_full.train()
-                losses_generator, generated = generator_full(x, add_expression=False) #TODO: add_expressions=False is used to avoid the expression loss
+                losses_generator, generated = generator_full(x, add_expression=opt.add_expr, rec_driving=opt.rec_driv) #TODO: add_expressions=False is used to avoid the expression loss
 
                 loss_values = [val.mean() for val in losses_generator.values()]
                 loss = sum(loss_values)
@@ -120,7 +120,7 @@ def train(rank: int, world_size: int, config: dict,
                                         'optimizer_he_estimator': optimizer_he_estimator}, inp=x, out=generated)
         
                 # Validation
-                run_validation(generator_full, val_loader, device, epoch, logger, writer)
+                _ = run_validation(generator_full, val_loader, device, epoch, logger, writer)
 
     destroy_process_group()
             
@@ -136,3 +136,5 @@ def run_validation(generator_full, val_loader, device, epoch, logger, writer=Non
         # Tensorboard TODO: Add more metrics like psnr, ssim, etc.
         if writer is not None:
             logger.log_tensorboard('val', losses, generated['prediction'].detach(), vaL_batch['driving'].detach(), epoch)
+
+    return vaL_batch, generated

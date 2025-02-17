@@ -6,6 +6,7 @@ from modules.util import mesh_grid, norm_grid
 from modules.expression_encoder import get_expression_encoder
 from modules.expression_warper import ExpressionWarper
 from modules.dense_motion import DenseMotionNetwork
+from modules.crossconvat import CrossConvAttention
 
 
 class OcclusionAwareGenerator(nn.Module):
@@ -25,8 +26,8 @@ class OcclusionAwareGenerator(nn.Module):
             self.dense_motion_network = None
 
         if expression_enc_params is not None:
-            self.expression_encoder = get_expression_encoder(**expression_enc_params)
-            self.expression_warper = ExpressionWarper(expression_enc_params['num_classes'])
+            self.crossconvat = CrossConvAttention(**expression_enc_params)
+            # print("No expr encoder")
         else:
             self.expression_encoder = None
             self.expression_warper = None
@@ -89,7 +90,13 @@ class OcclusionAwareGenerator(nn.Module):
             motion_gird = motion_gird.permute(0, 2, 3, 4, 1) # (bs, 3, d, h, w) -> (bs, d, h, w, 3)
         return F.grid_sample(feature, motion_gird, padding_mode='border', align_corners=True)
 
-    def forward(self, source_image, driving_image, kp_driving, kp_source):
+    def occlude_input(self, inp, occlusion_map):
+        if inp.shape[2] != occlusion_map.shape[2] or inp.shape[3] != occlusion_map.shape[3]:
+            occlusion_map = F.interpolate(occlusion_map, size=inp.shape[2:], mode='bilinear',align_corners=True)
+        out = inp * occlusion_map
+        return out
+    
+    def forward(self, source_image, driving_image, kp_driving, kp_source, rec_driving=False):
         output_dict = {}
         #NOTE: feature volume for `driving` image
         out = self.first(driving_image)
@@ -98,9 +105,9 @@ class OcclusionAwareGenerator(nn.Module):
         out = self.second(out)
         bs, c, h, w = out.shape
         # print(out.shape)
-        feature_3d = out.view(bs, self.reshape_channel, self.reshape_depth, h ,w) 
-        feature_3d = self.resblocks_3d(feature_3d)
-        output_dict['feature_3d_driving'] = feature_3d
+        feature_3d_d = out.view(bs, self.reshape_channel, self.reshape_depth, h ,w) 
+        feature_3d_d = self.resblocks_3d(feature_3d_d)
+        output_dict['feature_3d_driving'] = feature_3d_d
 
         # Encoding (downsampling) part
         out = self.first(source_image)
@@ -114,54 +121,60 @@ class OcclusionAwareGenerator(nn.Module):
         output_dict['feature_3d_source'] = feature_3d
 
         # Transforming feature representation according to deformation and occlusion
-        if self.dense_motion_network is not None:
-            dense_motion = self.dense_motion_network(feature=feature_3d, kp_driving=kp_driving,
-                                                     kp_source=kp_source)
-            output_dict['mask'] = dense_motion['mask']
+        dense_motion = self.dense_motion_network(feature=feature_3d, kp_driving=kp_driving,
+                                                    kp_source=kp_source)
+        output_dict['mask'] = dense_motion['mask']
 
-            if 'occlusion_map' in dense_motion:
-                occlusion_map = dense_motion['occlusion_map']
-                output_dict['occlusion_map'] = occlusion_map
-            else:
-                occlusion_map = None
-            deformation = dense_motion['deformation']
-            out = self.deform_input(feature_3d, deformation)
+        if 'occlusion_map' in dense_motion:
+            occlusion_map = dense_motion['occlusion_map']
+            output_dict['occlusion_map'] = occlusion_map
+        else:
+            occlusion_map = None
+        output_dict['deformation'] = dense_motion['deformation'].detach()
+        deformation = dense_motion['deformation']
+        feature_3d_deformed = self.deform_input(feature_3d, deformation)
+        _, c, d, h, w = feature_3d_deformed.shape
+        feature_3d_deformed = feature_3d_deformed.view(bs, c*d, h, w)
+        feature_3d_deformed = self.occlude_input(feature_3d_deformed, occlusion_map).view(bs, c, d, h, w)
 
-            # Expression warping after deformation from the keypoint-generated warping fields
-            if self.expression_encoder is not None: #TODO: Add the ternary loss, smoothness loss for the w_em, and optimize the expression encoder a d warper seperately (find a away)
-                expression = self.expression_encoder(driving_image)
-                output_dict_em = self.expression_warper(expression)
-                w_emotion = output_dict_em['w_em']
-                if 'occlusion_map' in output_dict_em:
-                    occlusion_map_em = output_dict_em['occlusion_map']
-                    output_dict['occlusion_map_em'] = occlusion_map_em
-                out = self.warp_emotion_feature(out, w_emotion)
+        #TODO: Encode Expr from feat volumes and refine expr on feat_3d_deformed (Try all trials on Trello)
+        att_dict = self.crossconvat(feature_3d_deformed, feature_3d_d)
+        output_dict.update(att_dict)
+        features_refined = output_dict['features_refined']
 
-            bs, c, d, h, w = out.shape
-            out = out.view(bs, c*d, h, w)
-            out = self.third(out)
-            out = self.fourth(out)
-
-            if occlusion_map is not None:
-                if out.shape[2] != occlusion_map.shape[2] or out.shape[3] != occlusion_map.shape[3]:
-                    occlusion_map = F.interpolate(occlusion_map, size=out.shape[2:], mode='bilinear')
-                out = out * occlusion_map
-            
-            if occlusion_map_em is not None:
-                if out.shape[2] != occlusion_map_em.shape[2] or out.shape[3] != occlusion_map_em.shape[3]:
-                    occlusion_map_em = F.interpolate(occlusion_map_em, size=out.shape[2:], mode='bilinear')
-                out = out * occlusion_map_em
-
-            # output_dict["deformed"] = self.deform_input(source_image, deformation)  # 3d deformation cannot deform 2d image
+        ## Use f_3d_s_warped (deformed) to get the output
+        # features_refined = features_refined.view(bs, c*d, h, w)
+        feature_3d_deformed = feature_3d_deformed.view(bs, c*d, h, w)
+        out  = feature_3d_deformed * (1 - occlusion_map) + features_refined * occlusion_map
+        out = self.third(out)
+        out = self.fourth(out)
 
         # Decoding part
         out = self.resblocks_2d(out)
         for i in range(len(self.up_blocks)):
             out = self.up_blocks[i](out)
+        
         out = self.final(out)
         out = F.sigmoid(out)
 
         output_dict["prediction"] = out
+
+        if rec_driving:
+            ## Use f_3d_d to get the output
+            bs, c, d, h, w = feature_3d_d.shape
+            out = feature_3d_d.detach().view(bs, c*d, h, w)
+            out = self.third(out)
+            out = self.fourth(out)
+            # Decoding part
+            out = self.resblocks_2d(out)
+            for i in range(len(self.up_blocks)):
+                out = self.up_blocks[i](out)
+            out = self.final(out)
+            out = F.sigmoid(out)
+
+            output_dict["driving_rec"] = out
+        else:
+            output_dict["driving_rec"] = None
 
         return output_dict
 

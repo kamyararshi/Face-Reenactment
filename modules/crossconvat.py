@@ -152,15 +152,15 @@ class ExpressionEncoder3d(nn.Module):
 
 
 class CrossConvAttention(nn.Module):
-    def __init__(self, projection_dim=512, in_channel=512, d_model=512):
+    def __init__(self, projection_dim=512, in_channel=512, d_model=512, encode_src=True, encode_drv=False):
         super().__init__()
         self.projection_dim = projection_dim
         self.sqrt_d = math.sqrt(self.projection_dim)
         self.channel_32 = 512
         self.channel_64 = 256
         self.channel_128 = 128
-        self.expression_encoder_src = ExpressionEncoder(in_channel=in_channel, d_model=d_model, encode=False)
-        self.expression_encoder_drv = ExpressionEncoder(in_channel=in_channel, d_model=d_model, encode=False)
+        self.expression_encoder_src = ExpressionEncoder(in_channel=in_channel, d_model=d_model, encode=encode_src)
+        self.expression_encoder_drv = ExpressionEncoder(in_channel=in_channel, d_model=d_model, encode=encode_drv)
         self.conv_query = nn.Conv2d(in_channels=d_model, out_channels=self.projection_dim, kernel_size=1)
         self.conv_key = nn.Conv2d(in_channels=d_model, out_channels=self.projection_dim, kernel_size=1)
         self.conv_value = nn.Conv2d(in_channels=d_model, out_channels=self.projection_dim, kernel_size=1)

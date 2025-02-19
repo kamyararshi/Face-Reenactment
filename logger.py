@@ -241,6 +241,45 @@ class Visualizer:
         prediction = np.transpose(prediction, [0, 2, 3, 1])
         images.append(prediction)
 
+        # Driving image reconstructed using it's feat_3d
+        if out['driving_rec'] is not None:
+            driving_rec = out['driving_rec'].data.cpu().numpy()
+            driving_rec = np.transpose(driving_rec, [0, 2, 3, 1])
+            images.append(driving_rec)
+
+        ## Expression map source
+        chunks = out['expr_source'].data.cpu().chunk(3, dim=1)
+        expr_source = torch.stack([chunk.mean(dim=1) for chunk in chunks], dim=1)  # (b, 3, 32, 32)
+        expr_source = F.interpolate(expr_source, size=source.shape[1:3]).numpy()
+        expr_source = np.transpose(expr_source, [0, 2, 3, 1])
+        images.append(expr_source)
+        
+        ## Expression map driving
+        chunks = out['expr_driving'].data.cpu().chunk(3, dim=1)
+        expr_driving = torch.stack([chunk.mean(dim=1) for chunk in chunks], dim=1)  # (b, 3, 32, 32)
+        expr_driving = F.interpolate(expr_driving, size=source.shape[1:3]).numpy()
+        expr_driving = np.transpose(expr_driving, [0, 2, 3, 1])
+        images.append(expr_driving)   
+
+        ## Feature Vol Expression Residual
+        chunks = out['residual'].data.cpu().chunk(3, dim=1)
+        feat_vol_expr_residual = torch.stack([chunk.mean(dim=1) for chunk in chunks], dim=1)  # (b, 3, 32, 32)
+        feat_vol_expr_residual = F.interpolate(feat_vol_expr_residual, size=source.shape[1:3]).numpy()
+        feat_vol_expr_residual = np.transpose(feat_vol_expr_residual, [0, 2, 3, 1])
+        images.append(feat_vol_expr_residual)
+
+        ## Refined Feature Vol on expr residual
+        chunks =  out['features_refined'].data.cpu().chunk(3, dim=1)
+        # b, c, d, h, w = temp.shape
+        # chunks = temp.view(b, c*d, h, w).chunk(3, dim=1)
+        refined_feat_vol = torch.stack([chunk.mean(dim=1) for chunk in chunks], dim=1)  # (b, 3, 32, 32)
+        refined_feat_vol = F.interpolate(refined_feat_vol, size=source.shape[1:3]).numpy()
+        refined_feat_vol = np.transpose(refined_feat_vol, [0, 2, 3, 1])
+        images.append(refined_feat_vol)
+        
+        ## Optical Flow deformation
+        #TODO:
+        
         ## Occlusion map
         if 'occlusion_map' in out:
             occlusion_map = out['occlusion_map'].data.cpu().repeat(1, 3, 1, 1)
@@ -268,6 +307,8 @@ class Visualizer:
                 else:
                     images.append(mask)
 
+        # print(refined_feat_vol.shape, feat_vol_expr_residual.shape, expr_driving.shape, expr_source.shape, driving_rec.shape, prediction.shape)
+        # print(driving.shape, kp_driving.shape, source.shape, kp_source.shape, mask.shape, occlusion_map.shape)
         image = self.create_image_grid(*images)
         image = (255 * image).astype(np.uint8)
         return image

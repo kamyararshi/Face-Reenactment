@@ -1,15 +1,19 @@
 import numpy as np
 import torch
+import torch.nn
 import torch.nn.functional as F
 from torch.distributed import destroy_process_group
 import imageio
 
 import os
-from typing import Dict
+from typing import Dict, Tuple
 from skimage.draw import circle
 
 import matplotlib.pyplot as plt
 import collections
+import torch.utils
+import torch.utils.data
+from modules.utils_flow import flow_to_image
 from torchmetrics.functional.image import structural_similarity_index_measure as ssim
 from torchmetrics.functional.image import peak_signal_noise_ratio as psnr
 
@@ -78,6 +82,69 @@ class Logger:
             torch.save(cpk, cpk_path)
 
     @staticmethod
+    @torch.no_grad()
+    def plot_flows(flow: torch.tensor, save=None) -> None:
+        """ Plots the estimated optical flow for each keypoint in each batch
+        Args:
+            - flow: torch.tensor of shape (batch_size, num_flow, height, width, 2)
+            - save: str, path to save the plot
+        """
+        batch_size = flow.shape[0]
+        num_flow = flow.shape[1]
+        fig, axs = plt.subplots(batch_size, num_flow, figsize=(20, 20))
+        for i in range(batch_size):
+            for j in range(num_flow):
+                flow_color = flow_to_image(flow[i][j].detach().cpu().permute(2,0,1)[:2]).numpy().transpose(1,2,0)
+                axs[i, j].imshow(flow_color)
+                axs[i, j].axis('off')
+        if save is None:
+            plt.show()
+        else:
+            plt.savefig(save)
+            plt.close()
+    
+    @staticmethod
+    def plot_images(inputs: dict, output: dict, save_path: str = None) -> None:
+        """
+        For each batch in the input and output, plots
+            the source, driving, and the output image next to each other. Each row is a batch.
+        Source shape: (batch_size, 3, 256, 256)
+        """
+        source = inputs['source']
+        driving = inputs['driving']
+        prediction = output['prediction']
+
+        batch_size = source.shape[0]
+        fig, axs = plt.subplots(batch_size, 3, figsize=(15, 5 * batch_size), squeeze=False)
+        for i in range(batch_size):
+            axs[i, 0].imshow(source[i].detach().cpu().numpy().transpose(1, 2, 0))
+            axs[i, 1].imshow(driving[i].detach().cpu().numpy().transpose(1, 2, 0))
+            axs[i, 2].imshow(prediction[i].detach().cpu().numpy().transpose(1, 2, 0))
+        #axis off
+        for ax in axs.flatten():
+            ax.axis('off')
+        if save_path is not None:
+            plt.savefig(save_path)
+        else:
+            plt.show()
+
+    @staticmethod
+    @torch.no_grad()
+    def cross_reenactment(dataloader: torch.utils.data.DataLoader, generator_full: torch.nn.Module, device: torch.device):
+        """
+        Given a dataloader and a generator model, performs cross reenactment on the first two batches of the dataloader.
+        """
+        corss_input={}
+        names = ('driving', 'source')
+        for x,name in zip(dataloader, names):
+            x = {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in x.items()}
+            corss_input[name] = x[name]
+            
+        _, out = generator_full(corss_input, rec_driving=True, add_expression=True)
+        
+        return corss_input, out
+    
+    @staticmethod
     def move_optimizer_states(optimizer, device):
         """
         Moves all state tensors in an optimizer to the specified device.
@@ -110,6 +177,8 @@ class Logger:
         """
         if rank is not None:
             map_location = f"cuda:{rank}"  # Map checkpoint to the rank-specific GPU
+        else:
+            map_location = 'cpu'
 
         checkpoint = torch.load(checkpoint_path, map_location=map_location)
 
@@ -162,8 +231,10 @@ class Logger:
             destroy_process_group()
         self.log_file.close()
 
-    def log_iter(self, losses):
+    def log_iter(self, losses, epoch, global_epoch):
         losses = collections.OrderedDict(losses.items())
+        self.epoch = epoch
+        self.global_epoch = global_epoch
         if self.names is None:
             self.names = list(losses.keys())
         self.loss_list.append(list(losses.values()))
@@ -176,6 +247,8 @@ class Logger:
             self.save_cpk()
         # self.log_scores(self.names)
         self.visualize_rec(inp, out)
+        save_flow_path = os.path.join(self.visualizations_dir, "%s-flow.png" % str(self.epoch).zfill(self.zfill_num))
+        Logger.plot_flows(out['deformation'].detach(), save=save_flow_path)
 
 
 class Visualizer:
@@ -248,37 +321,35 @@ class Visualizer:
             images.append(driving_rec)
 
         ## Expression map source
-        chunks = out['expr_source'].data.cpu().chunk(3, dim=1)
-        expr_source = torch.stack([chunk.mean(dim=1) for chunk in chunks], dim=1)  # (b, 3, 32, 32)
-        expr_source = F.interpolate(expr_source, size=source.shape[1:3]).numpy()
-        expr_source = np.transpose(expr_source, [0, 2, 3, 1])
-        images.append(expr_source)
-        
-        ## Expression map driving
-        chunks = out['expr_driving'].data.cpu().chunk(3, dim=1)
-        expr_driving = torch.stack([chunk.mean(dim=1) for chunk in chunks], dim=1)  # (b, 3, 32, 32)
-        expr_driving = F.interpolate(expr_driving, size=source.shape[1:3]).numpy()
-        expr_driving = np.transpose(expr_driving, [0, 2, 3, 1])
-        images.append(expr_driving)   
+        if 'expr_source' in out:
+            chunks = out['expr_source'].data.cpu().chunk(3, dim=1)
+            expr_source = torch.stack([chunk.mean(dim=1) for chunk in chunks], dim=1)  # (b, 3, 32, 32)
+            expr_source = F.interpolate(expr_source, size=source.shape[1:3]).numpy()
+            expr_source = np.transpose(expr_source, [0, 2, 3, 1])
+            images.append(expr_source)
+            
+            ## Expression map driving
+            chunks = out['expr_driving'].data.cpu().chunk(3, dim=1)
+            expr_driving = torch.stack([chunk.mean(dim=1) for chunk in chunks], dim=1)  # (b, 3, 32, 32)
+            expr_driving = F.interpolate(expr_driving, size=source.shape[1:3]).numpy()
+            expr_driving = np.transpose(expr_driving, [0, 2, 3, 1])
+            images.append(expr_driving)   
 
-        ## Feature Vol Expression Residual
-        chunks = out['residual'].data.cpu().chunk(3, dim=1)
-        feat_vol_expr_residual = torch.stack([chunk.mean(dim=1) for chunk in chunks], dim=1)  # (b, 3, 32, 32)
-        feat_vol_expr_residual = F.interpolate(feat_vol_expr_residual, size=source.shape[1:3]).numpy()
-        feat_vol_expr_residual = np.transpose(feat_vol_expr_residual, [0, 2, 3, 1])
-        images.append(feat_vol_expr_residual)
+            ## Feature Vol Expression Residual
+            chunks = out['residual'].data.cpu().chunk(3, dim=1)
+            feat_vol_expr_residual = torch.stack([chunk.mean(dim=1) for chunk in chunks], dim=1)  # (b, 3, 32, 32)
+            feat_vol_expr_residual = F.interpolate(feat_vol_expr_residual, size=source.shape[1:3]).numpy()
+            feat_vol_expr_residual = np.transpose(feat_vol_expr_residual, [0, 2, 3, 1])
+            images.append(feat_vol_expr_residual)
 
-        ## Refined Feature Vol on expr residual
-        chunks =  out['features_refined'].data.cpu().chunk(3, dim=1)
-        # b, c, d, h, w = temp.shape
-        # chunks = temp.view(b, c*d, h, w).chunk(3, dim=1)
-        refined_feat_vol = torch.stack([chunk.mean(dim=1) for chunk in chunks], dim=1)  # (b, 3, 32, 32)
-        refined_feat_vol = F.interpolate(refined_feat_vol, size=source.shape[1:3]).numpy()
-        refined_feat_vol = np.transpose(refined_feat_vol, [0, 2, 3, 1])
-        images.append(refined_feat_vol)
-        
-        ## Optical Flow deformation
-        #TODO:
+            ## Refined Feature Vol on expr residual
+            chunks =  out['features_refined'].data.cpu().chunk(3, dim=1)
+            # b, c, d, h, w = temp.shape
+            # chunks = temp.view(b, c*d, h, w).chunk(3, dim=1)
+            refined_feat_vol = torch.stack([chunk.mean(dim=1) for chunk in chunks], dim=1)  # (b, 3, 32, 32)
+            refined_feat_vol = F.interpolate(refined_feat_vol, size=source.shape[1:3]).numpy()
+            refined_feat_vol = np.transpose(refined_feat_vol, [0, 2, 3, 1])
+            images.append(refined_feat_vol)
         
         ## Occlusion map
         if 'occlusion_map' in out:

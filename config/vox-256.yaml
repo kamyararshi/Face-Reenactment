@@ -3,17 +3,19 @@ dataset_params:
   frame_shape: [256, 256, 3]
   id_sampling: False
   pairs_list: None
-  use_augmentation: False # For now let's see how it will do without augmentation
+  use_augmentation: True # For now let's see how it will do without augmentation
   dataset_amount: null
   augmentation_params:
     flip_param:
       horizontal_flip: True
-      time_flip: True
+      time_flip: False
     jitter_param:
       brightness: 0.1
       contrast: 0.1
       saturation: 0.1
       hue: 0.1
+    rotation_param:
+      degrees: 15
 
 
 model_params:
@@ -50,9 +52,10 @@ model_params:
       reshape_depth: 16
       compress: 4
     expression_enc_params:
-      projection_dim: 512
+      projection_dim: 128
       in_channel: 512
-      d_model: 512
+      d_model: 128
+      encode_feat: True
       encode_src: True
       encode_drv: True
   discriminator_params:

@@ -4,12 +4,12 @@ from skimage.color import gray2rgb
 from sklearn.model_selection import train_test_split
 from imageio import mimread
 
+import torch
 from torchvision import transforms
 from PIL import Image
 import random
 import numpy as np
 from torch.utils.data import Dataset
-import pandas as pd
 from augmentation import AllAugmentationTransform
 import glob
 import re
@@ -98,18 +98,18 @@ class ImagesDataset(Dataset):
         if self.is_train and (self.augmentation_params!=None) and self.use_augmentation:
             print("Augmentation Active")
             self.transform = AllAugmentationTransform(**augmentation_params)
+        
+        if self.id_sampling:
+            raise NotImplementedError("ID Sampling not implemented yet")
+            # name = self.videos[idx]
+            # path = np.random.choice(glob.glob(os.path.join(self.root_dir, name + '*.mp4')))
 
         
     def __len__(self):
         return self.num_classes
 
     def __getitem__(self, idx):
-        if self.is_train and self.id_sampling:
-            raise NotImplementedError("ID Sampling not implemented yet")
-            # name = self.videos[idx]
-            # path = np.random.choice(glob.glob(os.path.join(self.root_dir, name + '*.mp4')))
-        else:
-            random_class = self.classes_list[idx]
+        random_class = self.classes_list[idx]
             
         images_list = os.listdir(os.path.join(self.data_dir, random_class))
         
@@ -125,16 +125,14 @@ class ImagesDataset(Dataset):
 
         out = {}
         if self.is_train and self.use_augmentation:
-            out['driving']  = self.transform(self.pre_transform(img1_raw))
-            out['source'] = self.transform(self.pre_transform(img2_raw))
+            # Augmentations only on the source image
+            out['driving'] = self.pre_transform(img1_raw).to(torch.float32)
+            out['source'] = self.pre_transform(self.transform(img2_raw)).to(torch.float32)
 
         elif (self.is_train and not self.use_augmentation) or not self.is_train:
-            out['driving']  = self.pre_transform(img1_raw)
-            out['source'] = self.pre_transform(img2_raw)
+            out['driving']  = self.pre_transform(img1_raw).to(torch.float32)
+            out['source'] = self.pre_transform(img2_raw).to(torch.float32)
         else:
-            # video = np.array(video_array, dtype='float32')
-            # out['video'] = video.transpose((3, 0, 1, 2))
-            # out['video']=images_list
             raise ValueError("Invalid Mode. Should be either train or test")
 
         out['name'] = random_class

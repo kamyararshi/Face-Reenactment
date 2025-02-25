@@ -2,6 +2,7 @@ import torch.optim
 from torch.utils.data import Dataset
 import torch.nn as nn
 from tqdm import trange, tqdm
+import os
 import torch
 from tensorboardX import SummaryWriter
 from torch.optim.lr_scheduler import MultiStepLR
@@ -64,7 +65,7 @@ def train(rank: int, world_size: int, config: dict,
     writer = SummaryWriter(f'{log_dir}/runs/') if writer and rank==0 else None
 
     with Logger(log_dir=log_dir, visualizer_params=config['visualizer_params'], checkpoint_freq=train_params['checkpoint_freq'], writer=writer, ddp=True) as logger:
-        for epoch in trange(start_epoch, train_params['num_epochs']):
+        for epoch in trange(start_epoch, train_params['num_epochs'], initial=start_epoch, total=train_params['num_epochs']):
             for x in tqdm(dataloader):
                 global_epoch += 1
                 x = {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in x.items()}
@@ -97,7 +98,7 @@ def train(rank: int, world_size: int, config: dict,
                 losses_generator.update(losses_discriminator)
                 losses = {key: value.mean().detach().data.cpu().numpy() for key, value in losses_generator.items()}
                 if rank == 0: # Only the master node logs the losses' scores
-                    logger.log_iter(losses=losses)
+                    logger.log_iter(losses=losses, epoch=epoch, global_epoch=global_epoch)
                     logger.log_scores(logger.names)
                     # Tensorboard TODO: Add more metrics like psnr, ssim, etc.
                     if writer is not None:
@@ -137,4 +138,8 @@ def run_validation(generator_full, val_loader, device, epoch, logger, writer=Non
         if writer is not None:
             logger.log_tensorboard('val', losses, generated['prediction'].detach(), vaL_batch['driving'].detach(), epoch)
 
+    cross_input, out = Logger.cross_reenactment(val_loader, generator_full, device)
+    save_path = os.path.join(logger.visualizations_dir, "%s-crossreen.png" % str(epoch).zfill(logger.zfill_num))
+    #src, drv, corssreenact
+    Logger.plot_images(cross_input, out, save_path=save_path)
     return vaL_batch, generated

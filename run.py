@@ -40,6 +40,16 @@ if __name__ == "__main__":
     parser.set_defaults(rec_driv=False)
 
     opt = parser.parse_args()
+    if opt.checkpoint is not None:
+        # find the yaml file at the same directory as the checkpoint
+        yaml_file = [i for i in os.listdir(os.path.dirname(opt.checkpoint)) if i.endswith('.yaml')][0]
+        config_path = os.path.join(os.path.dirname(opt.checkpoint), yaml_file)
+        if os.path.exists(config_path):
+            opt.config = config_path
+            print(f"Using config file at {opt.config}")
+        else:
+            print(f"Using config file at {opt.config}")
+
     with open(opt.config) as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
 

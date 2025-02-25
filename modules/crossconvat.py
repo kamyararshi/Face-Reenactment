@@ -99,13 +99,14 @@ class BasicBlock3d(nn.Module):
 
 
 class ExpressionEncoder(nn.Module):
-    def __init__(self, in_channel=512, d_model=512, encode=False):
+    def __init__(self, in_channel=512, d_model=128, encode=True):
         super().__init__()
         self.d_model = d_model
         self.encode = encode
         self.sqrt_d = math.sqrt(self.d_model)
         self.rearange = Rearrange('b c d h w -> b (c d) h w')
-        self.block = BasicBlock(inplanes=in_channel, planes=d_model) if self.encode else None
+        self.projection = nn.Conv2d(in_channels=in_channel, out_channels=d_model, kernel_size=1)
+        self.block = BasicBlock(inplanes=d_model, planes=d_model) if self.encode else None
         self.norm = nn.BatchNorm2d(d_model)
         self.convq = nn.Conv2d(in_channels=d_model, out_channels=d_model, kernel_size=1)
         # self.convkv = Dynamic_conv2d(in_channels=d_model, out_planes=d_model*2, kernel_size=3, ratio=0.25, padding=1,groups=1)
@@ -114,6 +115,9 @@ class ExpressionEncoder(nn.Module):
     def forward(self, x):
         x = self.rearange(x)
         b,c,w,h = x.shape
+        if self.encode:
+            x = self.projection(x)
+            x = self.block(x)
         query = F.relu(self.convq(x))
         key,value = F.relu(self.convkv(x)).chunk(2, dim = 1)
         q, k, v = map(lambda t: rearrange(t, 'b c x y -> b (x y) c'), (query,key,value))
@@ -124,8 +128,6 @@ class ExpressionEncoder(nn.Module):
         # Add and Norm
         residual = rearrange(residual, 'b (x y) c -> b c x y', x=w,y=h)
         residual = self.norm(residual+x)
-        if self.encode:
-            residual = self.block(residual)
         return residual
     
 class ExpressionEncoder3d(nn.Module):
@@ -152,34 +154,35 @@ class ExpressionEncoder3d(nn.Module):
 
 
 class CrossConvAttention(nn.Module):
-    def __init__(self, projection_dim=512, in_channel=512, d_model=512, encode_src=True, encode_drv=False):
+    def __init__(self, projection_dim=128, in_channel=512, d_model=128, encode_feat=True, encode_src=True, encode_drv=False):
         super().__init__()
         self.projection_dim = projection_dim
         self.sqrt_d = math.sqrt(self.projection_dim)
         self.channel_32 = 512
         self.channel_64 = 256
         self.channel_128 = 128
-        self.expression_encoder_src = ExpressionEncoder(in_channel=in_channel, d_model=d_model, encode=encode_src)
-        self.expression_encoder_drv = ExpressionEncoder(in_channel=in_channel, d_model=d_model, encode=encode_drv)
+        # self.expression_encoder_src = ExpressionEncoder(in_channel=in_channel, d_model=d_model, encode=encode_src)
+        # self.expression_encoder_drv = ExpressionEncoder(in_channel=in_channel, d_model=d_model, encode=encode_drv)
+        self.expression_encoder = ExpressionEncoder(in_channel=in_channel, d_model=d_model, encode=encode_feat)
         self.conv_query = nn.Conv2d(in_channels=d_model, out_channels=self.projection_dim, kernel_size=1)
         self.conv_key = nn.Conv2d(in_channels=d_model, out_channels=self.projection_dim, kernel_size=1)
         self.conv_value = nn.Conv2d(in_channels=d_model, out_channels=self.projection_dim, kernel_size=1)
-        self.diff_conv = nn.Conv3d(in_channels=32, out_channels=32, kernel_size= 1, padding=0)
-        self.diff_conv = nn.Conv2d(in_channels=512, out_channels=512, kernel_size= 1, padding=0)
+        # self.diff_conv = nn.Conv3d(in_channels=32, out_channels=32, kernel_size= 1, padding=0)
+        self.project_back = nn.Conv2d(in_channels=d_model, out_channels=in_channel, kernel_size=1)
+        self.diff_conv = nn.Conv2d(in_channels=in_channel, out_channels=in_channel, kernel_size= 1, padding=0)
 
     def forward(self, features_deformed, features_driving):
         # Encode warped source features and driving features for expression
         b, x, y, i, j = features_deformed.shape
         out = {}
-        residual_source = self.expression_encoder_src(features_deformed)
+        residual_source = self.expression_encoder(features_deformed)
         out['expr_source'] = residual_source
         b, c, w, h = residual_source.shape
-        residual_driving = self.expression_encoder_drv(features_driving)
+        residual_driving = self.expression_encoder(features_driving)
         out['expr_driving'] = residual_driving
         # Compute Cross-Attention
-        # Compute query
+        # Compute query, key, and value
         query = self.conv_query(residual_source)
-        # Compute key and value
         key = self.conv_key(residual_driving)
         value = self.conv_value(residual_driving)
         q, k, v = map(lambda t: rearrange(t, 'b c x y -> b (x y) c'), (query,key,value))
@@ -191,6 +194,7 @@ class CrossConvAttention(nn.Module):
 
         # Compute difference
         # residual = residual.view(b, x, y, i, j)
+        residual = F.relu(self.project_back(residual))
         # diff =F.relu( self.diff_conv(features_deformed - residual))
         # out['features_refined'] = F.relu(features_deformed + diff)
         out['features_refined'] = F.relu(self.diff_conv(residual))

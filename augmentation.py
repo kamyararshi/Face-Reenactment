@@ -5,12 +5,13 @@ Code from https://github.com/hassony2/torch_videovision
 import numbers
 
 import random
+import PIL.Image
 import numpy as np
 import PIL
 
 from skimage.transform import resize, rotate
 from skimage.util import pad
-import torchvision
+import torchvision.transforms.functional as TF
 
 import warnings
 
@@ -30,6 +31,17 @@ def crop_clip(clip, min_h, min_w, h, w):
                         'but got list of {0}'.format(type(clip[0])))
     return cropped
 
+def crop_frame(clip, min_h, min_w, h, w):
+    if isinstance(clip, np.ndarray):
+        cropped = clip[min_h:min_h + h, min_w:min_w + w, :]
+
+    elif isinstance(clip, PIL.Image.Image):
+        cropped = clip.crop((min_w, min_h, min_w + w, min_h + h))
+            
+    else:
+        raise TypeError('Expected numpy.ndarray or PIL.Image' +
+                        'but got list of {0}'.format(type(clip)))
+    return cropped
 
 def pad_clip(clip, h, w):
     im_h, im_w = clip[0].shape[:2]
@@ -37,6 +49,12 @@ def pad_clip(clip, h, w):
     pad_w = (0, 0) if w < im_w else ((w - im_w) // 2, (w - im_w + 1) // 2)
 
     return pad(clip, ((0, 0), pad_h, pad_w, (0, 0)), mode='edge')
+
+def pad_frame(frame, h, w, im_h, im_w):
+    pad_h = (0, 0) if h < im_h else ((h - im_h) // 2, (h - im_h + 1) // 2)
+    pad_w = (0, 0) if w < im_w else ((w - im_w) // 2, (w - im_w + 1) // 2)
+
+    return pad(frame, ((0, 0), pad_h, pad_w, (0, 0)), mode='edge')
 
 
 def resize_clip(clip, size, interpolation='bilinear'):
@@ -89,16 +107,16 @@ def get_resize_sizes(im_h, im_w, size):
 
 
 class RandomFlip(object):
-    def __init__(self, time_flip=False, horizontal_flip=False):
+    def __init__(self, time_flip=False, horizontal_flip=True, image=True):
         self.time_flip = time_flip
         self.horizontal_flip = horizontal_flip
+        self.image = image
 
     def __call__(self, clip):
-        if random.random() < 0.5 and self.time_flip:
-            return clip[::-1]
         if random.random() < 0.5 and self.horizontal_flip:
-            return [np.fliplr(img) for img in clip]
-
+            # print("Horizontal flip Image")
+            return np.fliplr(clip)
+        
         return clip
 
 
@@ -146,28 +164,28 @@ class RandomCrop(object):
 
         self.size = size
 
-    def __call__(self, clip):
+    def __call__(self, frame):
         """
         Args:
-        img (PIL.Image or numpy.ndarray): List of videos to be cropped
+        img (PIL.Image or numpy.ndarray): Frame to be cropped
         in format (h, w, c) in numpy.ndarray
         Returns:
-        PIL.Image or numpy.ndarray: Cropped list of videos
+        PIL.Image or numpy.ndarray: Cropped frame
         """
         h, w = self.size
-        if isinstance(clip[0], np.ndarray):
-            im_h, im_w, im_c = clip[0].shape
-        elif isinstance(clip[0], PIL.Image.Image):
-            im_w, im_h = clip[0].size
+        if isinstance(frame, np.ndarray):
+            im_h, im_w, im_c = frame.shape
+        elif isinstance(frame, PIL.Image.Image):
+            im_w, im_h = frame.size
         else:
             raise TypeError('Expected numpy.ndarray or PIL.Image' +
-                            'but got list of {0}'.format(type(clip[0])))
+                            'but got list of {0}'.format(type(frame)))
 
-        clip = pad_clip(clip, h, w)
-        im_h, im_w = clip.shape[1:3]
+        frame = pad_frame(frame, h, w, im_h, im_w)
+        im_h, im_w = frame.size[1:]
         x1 = 0 if h == im_h else random.randint(0, im_w - w)
         y1 = 0 if w == im_w else random.randint(0, im_h - h)
-        cropped = crop_clip(clip, y1, x1, h, w)
+        cropped = crop_frame(frame, y1, x1, h, w)
 
         return cropped
 
@@ -203,13 +221,13 @@ class RandomRotation(object):
         PIL.Image or numpy.ndarray: Cropped list of videos
         """
         angle = random.uniform(self.degrees[0], self.degrees[1])
-        if isinstance(clip[0], np.ndarray):
-            rotated = [rotate(image=img, angle=angle, preserve_range=True) for img in clip]
-        elif isinstance(clip[0], PIL.Image.Image):
-            rotated = [img.rotate(angle) for img in clip]
+        if isinstance(clip, np.ndarray):
+            rotated = rotate(image=clip, angle=angle, preserve_range=False)
+        elif isinstance(clip, PIL.Image.Image):
+            rotated = clip.rotate(angle)
         else:
             raise TypeError('Expected numpy.ndarray or PIL.Image' +
-                            'but got list of {0}'.format(type(clip[0])))
+                            'but got list of {0}'.format(type(clip)))
 
         return rotated
 
@@ -265,64 +283,61 @@ class ColorJitter(object):
         Returns:
         list PIL.Image : list of transformed PIL.Image
         """
-        if isinstance(clip[0], np.ndarray):
+        if isinstance(clip, np.ndarray):
             brightness, contrast, saturation, hue = self.get_params(
                 self.brightness, self.contrast, self.saturation, self.hue)
 
             # Create img transform function sequence
             img_transforms = []
             if brightness is not None:
-                img_transforms.append(lambda img: torchvision.transforms.functional.adjust_brightness(img, brightness))
+                img_transforms.append(lambda img: TF.adjust_brightness(img, brightness))
             if saturation is not None:
-                img_transforms.append(lambda img: torchvision.transforms.functional.adjust_saturation(img, saturation))
+                img_transforms.append(lambda img: TF.adjust_saturation(img, saturation))
             if hue is not None:
-                img_transforms.append(lambda img: torchvision.transforms.functional.adjust_hue(img, hue))
+                img_transforms.append(lambda img: TF.adjust_hue(img, hue))
             if contrast is not None:
-                img_transforms.append(lambda img: torchvision.transforms.functional.adjust_contrast(img, contrast))
+                img_transforms.append(lambda img: TF.adjust_contrast(img, contrast))
             random.shuffle(img_transforms)
-            img_transforms = [img_as_ubyte, torchvision.transforms.ToPILImage()] + img_transforms + [np.array,
-                                                                                                     img_as_float]
+            img_transforms =  img_transforms + [np.array, img_as_float]
 
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                jittered_clip = []
-                for img in clip:
-                    jittered_img = img
-                    for func in img_transforms:
-                        jittered_img = func(jittered_img)
-                    jittered_clip.append(jittered_img.astype('float32'))
-        elif isinstance(clip[0], PIL.Image.Image):
+                jittered_img = clip
+                for func in img_transforms:
+                    jittered_img = func(jittered_img)#.astype('float32')
+        
+        elif isinstance(clip, PIL.Image.Image):
             brightness, contrast, saturation, hue = self.get_params(
                 self.brightness, self.contrast, self.saturation, self.hue)
 
             # Create img transform function sequence
             img_transforms = []
             if brightness is not None:
-                img_transforms.append(lambda img: torchvision.transforms.functional.adjust_brightness(img, brightness))
+                img_transforms.append(lambda img: TF.adjust_brightness(img, brightness))
             if saturation is not None:
-                img_transforms.append(lambda img: torchvision.transforms.functional.adjust_saturation(img, saturation))
+                img_transforms.append(lambda img: TF.adjust_saturation(img, saturation))
             if hue is not None:
-                img_transforms.append(lambda img: torchvision.transforms.functional.adjust_hue(img, hue))
+                img_transforms.append(lambda img: TF.adjust_hue(img, hue))
             if contrast is not None:
-                img_transforms.append(lambda img: torchvision.transforms.functional.adjust_contrast(img, contrast))
+                img_transforms.append(lambda img: TF.adjust_contrast(img, contrast))
             random.shuffle(img_transforms)
 
-            # Apply to all videos
-            jittered_clip = []
-            for img in clip:
-                for func in img_transforms:
-                    jittered_img = func(img)
-                jittered_clip.append(jittered_img)
+            # Apply to frame
+            for func in img_transforms:
+                jittered_img = func(clip)
 
         else:
             raise TypeError('Expected numpy.ndarray or PIL.Image' +
-                            'but got list of {0}'.format(type(clip[0])))
-        return jittered_clip
+                            'but got list of {0}'.format(type(clip)))
+        return jittered_img
 
 
 class AllAugmentationTransform:
     def __init__(self, resize_param=None, rotation_param=None, flip_param=None, crop_param=None, jitter_param=None):
         self.transforms = []
+
+        if jitter_param is not None:
+            self.transforms.append(ColorJitter(**jitter_param))
 
         if flip_param is not None:
             self.transforms.append(RandomFlip(**flip_param))
@@ -335,9 +350,6 @@ class AllAugmentationTransform:
 
         if crop_param is not None:
             self.transforms.append(RandomCrop(**crop_param))
-
-        if jitter_param is not None:
-            self.transforms.append(ColorJitter(**jitter_param))
 
     def __call__(self, clip):
         for t in self.transforms:

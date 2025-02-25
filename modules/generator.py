@@ -26,7 +26,7 @@ class OcclusionAwareGenerator(nn.Module):
             self.dense_motion_network = None
 
         if expression_enc_params is not None:
-            self.crossconvat = CrossConvAttention(**expression_enc_params)
+            self.crossconvat = None #CrossConvAttention(**expression_enc_params)
             # print("No expr encoder")
         else:
             self.expression_encoder = None
@@ -135,19 +135,20 @@ class OcclusionAwareGenerator(nn.Module):
         feature_3d_deformed = self.deform_input(feature_3d, deformation)
         _, c, d, h, w = feature_3d_deformed.shape
         feature_3d_deformed = feature_3d_deformed.view(bs, c*d, h, w)
-        feature_3d_deformed = self.occlude_input(feature_3d_deformed, occlusion_map).view(bs, c, d, h, w)
+        # feature_3d_deformed = self.occlude_input(feature_3d_deformed, occlusion_map).view(bs, c, d, h, w)
 
         #TODO: Encode Expr from feat volumes and refine expr on feat_3d_deformed (Try all trials on Trello)
-        att_dict = self.crossconvat(feature_3d_deformed, feature_3d_d)
-        output_dict.update(att_dict)
-        features_refined = output_dict['features_refined']
+        # att_dict = self.crossconvat(feature_3d_deformed, feature_3d_d)
+        # output_dict.update(att_dict)
+        # features_refined = output_dict['features_refined']
 
         ## Use f_3d_s_warped (deformed) to get the output
         # features_refined = features_refined.view(bs, c*d, h, w)
-        feature_3d_deformed = feature_3d_deformed.view(bs, c*d, h, w)
-        out  = feature_3d_deformed * (1 - occlusion_map) + features_refined * occlusion_map
-        out = self.third(out)
+        # out = feature_3d_deformed.view(bs, c*d, h, w)
+        # out  = feature_3d_deformed * (occlusion_map) + features_refined * occlusion_map
+        out = self.third(feature_3d_deformed)
         out = self.fourth(out)
+        out = self.occlude_input(out, occlusion_map)
 
         # Decoding part
         out = self.resblocks_2d(out)

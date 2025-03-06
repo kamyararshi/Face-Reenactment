@@ -70,6 +70,13 @@ class ImagePyramide(torch.nn.Module):
             out_dict['prediction_' + str(scale).replace('-', '.')] = down_module(x)
         return out_dict
 
+    @staticmethod
+    def make_dict(x, scales):
+        out_dict = {}
+        assert len(x) == len(scales), f"Scale {len(scales)} and input {len(x)} length should be the same"
+        for i in range(len(x)):
+            out_dict['prediction_' + str(scales[i]).replace('-', '.')] = x[i]
+        return out_dict
 
 class Transform:
     """
@@ -335,7 +342,8 @@ class GeneratorFullModel(torch.nn.Module):
         loss_values = {}
 
         pyramide_real = self.pyramid(x['driving'])
-        pyramide_generated = self.pyramid(generated['prediction'])
+        pyramide_generated = ImagePyramide.make_dict(generated['prediction'],
+                                                     self.scales[::-1])
 
         if sum(self.loss_weights['perceptual']['vgg']) != 0:
             value_total = 0
@@ -350,7 +358,10 @@ class GeneratorFullModel(torch.nn.Module):
         #TODO: Ternary Loss
         #NOTE: Right now, L1 loss
         if self.loss_weights['perceptual']['l1'] != 0:
-            loss_values['perceptual'] += self.loss_weights['perceptual']['l1'] * (x['driving'] - generated['prediction']).abs().mean()
+            value = 0
+            for scale in self.scales:
+                value += (pyramide_generated['prediction_' + str(scale)] - pyramide_real['prediction_' + str(scale)]).abs().mean()
+            loss_values['perceptual'] += self.loss_weights['perceptual']['l1'] * value
             
 
         if self.loss_weights['generator_gan'] != 0:
@@ -510,7 +521,7 @@ class DiscriminatorFullModel(torch.nn.Module):
 
     def forward(self, x, generated):
         pyramide_real = self.pyramid(x['driving'])
-        pyramide_generated = self.pyramid(generated['prediction'].detach())
+        pyramide_generated = ImagePyramide.make_dict([generated['prediction'][-1].detach()], self.scales)
 
         discriminator_maps_generated = self.discriminator(pyramide_generated)
         discriminator_maps_real = self.discriminator(pyramide_real)

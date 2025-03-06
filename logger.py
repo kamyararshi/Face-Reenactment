@@ -112,7 +112,7 @@ class Logger:
         """
         source = inputs['source']
         driving = inputs['driving']
-        prediction = output['prediction']
+        prediction = output['prediction'][-1]
 
         batch_size = source.shape[0]
         fig, axs = plt.subplots(batch_size, 3, figsize=(15, 5 * batch_size), squeeze=False)
@@ -140,7 +140,7 @@ class Logger:
             x = {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in x.items()}
             corss_input[name] = x[name]
             
-        _, out = generator_full(corss_input, rec_driving=True, add_expression=True)
+        _, out = generator_full(corss_input, rec_driving=False, add_expression=True)
         
         return corss_input, out
     
@@ -248,7 +248,7 @@ class Logger:
         # self.log_scores(self.names)
         self.visualize_rec(inp, out)
         save_flow_path = os.path.join(self.visualizations_dir, "%s-flow.png" % str(self.epoch).zfill(self.zfill_num))
-        Logger.plot_flows(out['deformation'].detach(), save=save_flow_path)
+        Logger.plot_flows(out['deformation'][-1].detach(), save=save_flow_path)
 
 
 class Visualizer:
@@ -310,7 +310,7 @@ class Visualizer:
         images.append((driving, kp_driving))
 
         # Result
-        prediction = out['prediction'].data.cpu().numpy()
+        prediction = out['prediction'][-1].data.cpu().numpy()
         prediction = np.transpose(prediction, [0, 2, 3, 1])
         images.append(prediction)
 
@@ -353,10 +353,17 @@ class Visualizer:
         
         ## Occlusion map
         if 'occlusion_map' in out:
-            occlusion_map = out['occlusion_map'].data.cpu().repeat(1, 3, 1, 1)
-            occlusion_map = F.interpolate(occlusion_map, size=source.shape[1:3]).numpy()
-            occlusion_map = np.transpose(occlusion_map, [0, 2, 3, 1])
-            images.append(occlusion_map)
+            if isinstance(out['occlusion_map'], torch.Tensor):
+                occlusion_map = out['occlusion_map'].data.cpu().repeat(1, 3, 1, 1)
+                occlusion_map = F.interpolate(occlusion_map, size=source.shape[1:3]).numpy()
+                occlusion_map = np.transpose(occlusion_map, [0, 2, 3, 1])
+                images.append(occlusion_map)
+            elif isinstance(out['occlusion_map'], list):
+                # for i in range(len(out['occlusion_map'])):
+                occlusion_map = out['occlusion_map'][-1].data.cpu().repeat(1, 3, 1, 1)
+                occlusion_map = F.interpolate(occlusion_map, size=source.shape[1:3]).numpy()
+                occlusion_map = np.transpose(occlusion_map, [0, 2, 3, 1])
+                images.append(occlusion_map)
         
         ## Mask
         if 'mask' in out:

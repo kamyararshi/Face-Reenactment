@@ -9,6 +9,24 @@ from sync_batchnorm import SynchronizedBatchNorm3d as BatchNorm3d
 import torch.nn.utils.spectral_norm as spectral_norm
 import re
 
+def corr3d(fmap1, fmap2):
+    """Computes correlation between 3D feature maps."""
+    batch, dim, depth, height, width = fmap1.shape
+
+    # Reshape fmap1 and fmap2 for matrix multiplication
+    fmap1_flat = fmap1.view(batch, dim, depth * height * width)
+    fmap2_flat = fmap2.view(batch, dim, depth * height * width)
+
+    # Compute correlation using matrix multiplication
+    correlation = torch.matmul(fmap1_flat.transpose(1, 2), fmap2_flat)
+
+    # Reshape correlation back to the desired output shape
+    correlation = correlation.view(batch, depth, height, width, 1, depth, height, width)
+
+    # Normalize by the square root of the dimension
+    correlation = correlation / torch.sqrt(torch.tensor(dim, dtype=torch.float32))
+
+    return correlation
 
 def kp2gaussian(kp, spatial_size, kp_variance):
     """
@@ -490,6 +508,70 @@ class SPADEResnetBlock(nn.Module):
         self.norm_1 = SPADE(fmiddle, label_nc)
         if self.learned_shortcut:
             self.norm_s = SPADE(fin, label_nc)
+
+    def forward(self, x, seg1):
+        x_s = self.shortcut(x, seg1)
+        dx = self.conv_0(self.actvn(self.norm_0(x, seg1)))
+        dx = self.conv_1(self.actvn(self.norm_1(dx, seg1)))
+        out = x_s + dx
+        return out
+
+    def shortcut(self, x, seg1):
+        if self.learned_shortcut:
+            x_s = self.conv_s(self.norm_s(x, seg1))
+        else:
+            x_s = x
+        return x_s
+
+    def actvn(self, x):
+        return F.leaky_relu(x, 2e-1)
+
+
+class SPADE3D(nn.Module):
+    def __init__(self, norm_nc, label_nc):
+        super().__init__()
+
+        self.param_free_norm = nn.BatchNorm3d(norm_nc, affine=False)
+        nhidden = 128
+
+        self.mlp_shared = nn.Sequential(
+            nn.Conv3d(label_nc, nhidden, kernel_size=3, padding=1),
+            nn.ReLU())
+        self.mlp_gamma = nn.Conv3d(nhidden, norm_nc, kernel_size=3, padding=1)
+        self.mlp_beta = nn.Conv3d(nhidden, norm_nc, kernel_size=3, padding=1)
+
+    def forward(self, x, segmap):
+        normalized = self.param_free_norm(x)
+        segmap = F.interpolate(segmap, size=x.size()[2:], mode='nearest')
+        actv = self.mlp_shared(segmap)
+        gamma = self.mlp_gamma(actv)
+        beta = self.mlp_beta(actv)
+        out = normalized * (1 + gamma) + beta
+        return out
+
+class SPADEResnetBlock3D(nn.Module):
+    def __init__(self, fin, fout, norm_G, label_nc, use_se=False, dilation=1):
+        super().__init__()
+        # Attributes
+        self.learned_shortcut = (fin != fout)
+        fmiddle = min(fin, fout)
+        self.use_se = use_se
+        # create conv layers
+        self.conv_0 = nn.Conv3d(fin, fmiddle, kernel_size=3, padding=dilation, dilation=dilation)
+        self.conv_1 = nn.Conv3d(fmiddle, fout, kernel_size=3, padding=dilation, dilation=dilation)
+        if self.learned_shortcut:
+            self.conv_s = nn.Conv3d(fin, fout, kernel_size=1, bias=False)
+        # apply spectral norm if specified
+        if 'spectral' in norm_G:
+            self.conv_0 = spectral_norm(self.conv_0)
+            self.conv_1 = spectral_norm(self.conv_1)
+            if self.learned_shortcut:
+                self.conv_s = spectral_norm(self.conv_s)
+        # define normalization layers
+        self.norm_0 = SPADE3D(fin, label_nc)
+        self.norm_1 = SPADE3D(fmiddle, label_nc)
+        if self.learned_shortcut:
+            self.norm_s = SPADE3D(fin, label_nc)
 
     def forward(self, x, seg1):
         x_s = self.shortcut(x, seg1)

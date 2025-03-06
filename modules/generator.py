@@ -5,7 +5,7 @@ from modules.util import ResBlock2d, SameBlock2d, UpBlock2d, DownBlock2d, ResBlo
 from modules.util import mesh_grid, norm_grid
 from modules.expression_encoder import get_expression_encoder
 from modules.expression_warper import ExpressionWarper
-from modules.dense_motion import DenseMotionNetwork
+from modules.dense_motion import DenseMotionInit, DenseMotionNetwork
 from modules.crossconvat import CrossConvAttention
 
 
@@ -15,7 +15,7 @@ class OcclusionAwareGenerator(nn.Module):
     """
 
     def __init__(self, image_channel, feature_channel, num_kp, block_expansion, max_features, num_down_blocks, reshape_channel, reshape_depth,
-                 num_resblocks, estimate_occlusion_map=False, dense_motion_params=None, expression_enc_params=None, estimate_jacobian=False):
+                 num_resblocks, estimate_occlusion_map=False, dense_motion_params=None, motion_refiner_params=None, expression_enc_params=None, estimate_jacobian=False):
         super(OcclusionAwareGenerator, self).__init__()
 
         if dense_motion_params is not None:
@@ -25,9 +25,8 @@ class OcclusionAwareGenerator(nn.Module):
         else:
             self.dense_motion_network = None
 
-        if expression_enc_params is not None:
-            self.crossconvat = None #CrossConvAttention(**expression_enc_params)
-            # print("No expr encoder")
+        if motion_refiner_params is not None:
+            self.motion_refiner = None #TODO: Change
         else:
             self.expression_encoder = None
             self.expression_warper = None
@@ -35,37 +34,61 @@ class OcclusionAwareGenerator(nn.Module):
         self.first = SameBlock2d(image_channel, block_expansion, kernel_size=(7, 7), padding=(3, 3))
 
         down_blocks = []
+        in_features = [] # for upblocks
+        out_features = [] # for upblocks
+        self.num_down_blocks = num_down_blocks
         for i in range(num_down_blocks):
-            in_features = min(max_features, block_expansion * (2 ** i))
-            out_features = min(max_features, block_expansion * (2 ** (i + 1)))
-            down_blocks.append(DownBlock2d(in_features, out_features, kernel_size=(3, 3), padding=(1, 1)))
+            in_feature = min(max_features, block_expansion * (2 ** i))
+            out_feature = min(max_features, block_expansion * (2 ** (i + 1)))
+            in_features.append(out_feature)
+            out_features.append(in_feature)
+            down_blocks.append(DownBlock2d(in_feature, out_feature, kernel_size=(3, 3), padding=(1, 1)))
         self.down_blocks = nn.ModuleList(down_blocks)
 
-        self.second = nn.Conv2d(in_channels=out_features, out_channels=max_features, kernel_size=1, stride=1)
+        up_blocks = []
+        in_features = in_features[::-1] # Reverse the order for upblocks
+        out_features = out_features[::-1] # Reverse the order for upblocks
+        for i in range(num_down_blocks):
+            up_blocks.append(UpBlock2d(in_features[i], out_features[i], kernel_size=(3, 3), padding=(1, 1)))
+        self.up_blocks = nn.ModuleList(up_blocks)
+        
+        resblock = []
+        for i in range(num_down_blocks):
+            resblock.append(ResBlock2d(in_features[i], kernel_size=(3, 3), padding=(1, 1)))
+            resblock.append(ResBlock2d(in_features[i], kernel_size=(3, 3), padding=(1, 1)))
+        self.resblock = nn.ModuleList(resblock)
 
         self.reshape_channel = reshape_channel
         self.reshape_depth = reshape_depth
-
+        
         self.resblocks_3d = torch.nn.Sequential()
         for i in range(num_resblocks):
             self.resblocks_3d.add_module('3dr' + str(i), ResBlock3d(reshape_channel, kernel_size=3, padding=1))
+        
 
-        out_features = block_expansion * (2 ** (num_down_blocks))
-        self.third = SameBlock2d(max_features, out_features, kernel_size=(3, 3), padding=(1, 1), lrelu=True)
-        self.fourth = nn.Conv2d(in_channels=out_features, out_channels=out_features, kernel_size=1, stride=1)
+        # TODO: Use a function predict_output that gives back the modules below given in_channel
+        self.predict_image = nn.ModuleList()
+        self.predict_image_512 = nn.Sequential(*[
+            nn.Conv2d(512, image_channel, kernel_size=(7, 7), padding=(3, 3)),
+            nn.Sigmoid()
+        ])
+        self.predict_image.append(self.predict_image_512)
+        self.predict_image_256 = nn.Sequential(*[
+            nn.Conv2d(256, image_channel, kernel_size=(7, 7), padding=(3, 3)),
+            nn.Sigmoid()
+        ])
+        self.predict_image.append( self.predict_image_256)
+        self.predict_image_128 = nn.Sequential(*[
+            nn.Conv2d(128, image_channel, kernel_size=(7, 7), padding=(3, 3)),
+            nn.Sigmoid()
+        ])
+        self.predict_image.append( self.predict_image_128)
+        self.predict_image_64 = nn.Sequential(*[
+            nn.Conv2d(block_expansion, image_channel, kernel_size=(7, 7), padding=(3, 3)),
+            nn.Sigmoid()
+        ])
+        self.predict_image.append( self.predict_image_64)
 
-        self.resblocks_2d = torch.nn.Sequential()
-        for i in range(num_resblocks):
-            self.resblocks_2d.add_module('2dr' + str(i), ResBlock2d(out_features, kernel_size=3, padding=1))
-
-        up_blocks = []
-        for i in range(num_down_blocks):
-            in_features = max(block_expansion, block_expansion * (2 ** (num_down_blocks - i)))
-            out_features = max(block_expansion, block_expansion * (2 ** (num_down_blocks - i - 1)))
-            up_blocks.append(UpBlock2d(in_features, out_features, kernel_size=(3, 3), padding=(1, 1)))
-        self.up_blocks = nn.ModuleList(up_blocks)
-
-        self.final = nn.Conv2d(block_expansion, image_channel, kernel_size=(7, 7), padding=(3, 3))
         self.estimate_occlusion_map = estimate_occlusion_map
         self.image_channel = image_channel
 
@@ -98,82 +121,55 @@ class OcclusionAwareGenerator(nn.Module):
     
     def forward(self, source_image, driving_image, kp_driving, kp_source, rec_driving=False):
         output_dict = {}
-        #NOTE: feature volume for `driving` image
-        out = self.first(driving_image)
-        for i in range(len(self.down_blocks)):
-            out = self.down_blocks[i](out)
-        out = self.second(out)
-        bs, c, h, w = out.shape
-        # print(out.shape)
-        feature_3d_d = out.view(bs, self.reshape_channel, self.reshape_depth, h ,w) 
-        feature_3d_d = self.resblocks_3d(feature_3d_d)
-        output_dict['feature_3d_driving'] = feature_3d_d
 
         # Encoding (downsampling) part
         out = self.first(source_image)
+        encoder_map = [out]
+
         for i in range(len(self.down_blocks)):
             out = self.down_blocks[i](out)
-        out = self.second(out)
+            encoder_map.append(out)
         bs, c, h, w = out.shape
-        # print(out.shape)
-        feature_3d = out.view(bs, self.reshape_channel, self.reshape_depth, h ,w) 
+        
+        feature_3d = out.view(bs, self.reshape_channel, self.reshape_depth, h, w)
         feature_3d = self.resblocks_3d(feature_3d)
-        output_dict['feature_3d_source'] = feature_3d
 
         # Transforming feature representation according to deformation and occlusion
-        dense_motion = self.dense_motion_network(feature=feature_3d, kp_driving=kp_driving,
+        dense_motion_init = self.dense_motion_network(feature=feature_3d, kp_driving=kp_driving,
                                                     kp_source=kp_source)
-        output_dict['mask'] = dense_motion['mask']
+        # output_dict['mask'] = dense_motion['mask']
+        output_dict['deformation'] = [dense_motion_init['deformation']]
 
-        if 'occlusion_map' in dense_motion:
-            occlusion_map = dense_motion['occlusion_map']
-            output_dict['occlusion_map'] = occlusion_map
+        if 'occlusion_map' in dense_motion_init:
+            occlusion_map = dense_motion_init['occlusion_map']
+            output_dict['occlusion_map'] = [occlusion_map]
         else:
             occlusion_map = None
-        output_dict['deformation'] = dense_motion['deformation'].detach()
-        deformation = dense_motion['deformation']
+        
+        deformation = dense_motion_init['deformation']
         feature_3d_deformed = self.deform_input(feature_3d, deformation)
         _, c, d, h, w = feature_3d_deformed.shape
-        feature_3d_deformed = feature_3d_deformed.view(bs, c*d, h, w)
-        # feature_3d_deformed = self.occlude_input(feature_3d_deformed, occlusion_map).view(bs, c, d, h, w)
-
-        #TODO: Encode Expr from feat volumes and refine expr on feat_3d_deformed (Try all trials on Trello)
-        # att_dict = self.crossconvat(feature_3d_deformed, feature_3d_d)
-        # output_dict.update(att_dict)
-        # features_refined = output_dict['features_refined']
-
-        ## Use f_3d_s_warped (deformed) to get the output
-        # features_refined = features_refined.view(bs, c*d, h, w)
-        # out = feature_3d_deformed.view(bs, c*d, h, w)
-        # out  = feature_3d_deformed * (occlusion_map) + features_refined * occlusion_map
-        out = self.third(feature_3d_deformed)
-        out = self.fourth(out)
+        out = feature_3d_deformed.view(bs, c*d, h, w)
         out = self.occlude_input(out, occlusion_map)
+        prediction = self.predict_image[0](out)
+        prediction_scales = [prediction]
+        decoder_map = [out]
 
-        # Decoding part
-        out = self.resblocks_2d(out)
         for i in range(len(self.up_blocks)):
+            out = self.resblock[2*i](out)
+            out = self.resblock[2*i+1](out)
+            out = self.occlude_input(out, occlusion_map)
             out = self.up_blocks[i](out)
-        
-        out = self.final(out)
-        out = F.sigmoid(out)
+            prediction = self.predict_image[i+1](out)
+            prediction_scales.append(prediction)
+            decoder_map.append(out)
 
-        output_dict["prediction"] = out
+        output_dict["prediction"] = prediction_scales
 
         if rec_driving:
-            ## Use f_3d_d to get the output
-            bs, c, d, h, w = feature_3d_d.shape
-            out = feature_3d_d.detach().view(bs, c*d, h, w)
-            out = self.third(out)
-            out = self.fourth(out)
-            # Decoding part
-            out = self.resblocks_2d(out)
-            for i in range(len(self.up_blocks)):
-                out = self.up_blocks[i](out)
-            out = self.final(out)
-            out = F.sigmoid(out)
-
-            output_dict["driving_rec"] = out
+            #TODO: Adapt this to the new encoders and decoders
+            out = self.first(driving_image)
+            NotImplementedError("This part is not implemented yet")
         else:
             output_dict["driving_rec"] = None
 

@@ -17,7 +17,7 @@ from logger import Logger
 from modules.model import GeneratorFullModel, DiscriminatorFullModel
 from frames_dataset import DatasetRepeater
 
-def ddp_setup(rank: int, world_size: int, backend: str='nccl', MASTER_ADDR: str='localhost', MASTER_PORT: str='12355') -> None:
+def ddp_setup(rank: int, world_size: int, backend: str='nccl', MASTER_ADDR: str='localhost', MASTER_PORT: str='12366') -> None:
     import os
     os.environ['MASTER_ADDR'] = MASTER_ADDR # Change this to the IP of the master node
     os.environ['MASTER_PORT'] = MASTER_PORT # Random free port
@@ -102,7 +102,7 @@ def train(rank: int, world_size: int, config: dict,
                     logger.log_scores(logger.names)
                     # Tensorboard TODO: Add more metrics like psnr, ssim, etc.
                     if writer is not None:
-                        logger.log_tensorboard('train', losses, generated['prediction'].detach(), x['driving'].detach(), global_epoch)
+                        logger.log_tensorboard('train', losses, generated['prediction'][-1].detach(), x['driving'].detach(), global_epoch)
 
             scheduler_generator.step()
             scheduler_discriminator.step()
@@ -123,7 +123,6 @@ def train(rank: int, world_size: int, config: dict,
                 # Validation
                 _ = run_validation(generator_full, val_loader, device, epoch, logger, writer)
 
-    destroy_process_group()
             
 
 @torch.no_grad()
@@ -136,7 +135,7 @@ def run_validation(generator_full, val_loader, device, epoch, logger, writer=Non
         losses = {key: value.mean().detach().data.cpu().numpy() for key, value in losses_generator.items()}
         # Tensorboard TODO: Add more metrics like psnr, ssim, etc.
         if writer is not None:
-            logger.log_tensorboard('val', losses, generated['prediction'].detach(), vaL_batch['driving'].detach(), epoch)
+            logger.log_tensorboard('val', losses, generated['prediction'][-1].detach(), vaL_batch['driving'].detach(), epoch)
 
     cross_input, out = Logger.cross_reenactment(val_loader, generator_full, device)
     save_path = os.path.join(logger.visualizations_dir, "%s-crossreen.png" % str(epoch).zfill(logger.zfill_num))

@@ -22,7 +22,7 @@ def train(config, generator, discriminator, kp_detector, he_estimator, opt, log_
 
     if opt.checkpoint is not None:
         start_epoch, global_epoch = Logger.load_cpk(opt.checkpoint, generator, discriminator, kp_detector, he_estimator,
-                                      optimizer_generator, optimizer_discriminator, optimizer_kp_detector, optimizer_he_estimator, device)
+                                      optimizer_generator, optimizer_discriminator, optimizer_kp_detector, optimizer_he_estimator, rank=device_id)
     else:
         start_epoch, global_epoch = 0, 0
 
@@ -90,7 +90,7 @@ def train(config, generator, discriminator, kp_detector, he_estimator, opt, log_
                 logger.log_scores(logger.names)
                 # Tensorboard: add more metrics like psnr, ssim, etc.
                 if writer is not None:
-                    logger.log_tensorboard('train', losses, generated['prediction'].detach(), x['driving'].detach(), global_epoch)
+                    logger.log_tensorboard('train', losses, generated['prediction'][-1].detach(), x['driving'].detach(), global_epoch)
 
             scheduler_generator.step()
             scheduler_discriminator.step()
@@ -122,7 +122,7 @@ def run_validation(generator_full, val_loader, device, epoch, logger, writer=Non
         losses = {key: value.mean().detach().data.cpu().numpy() for key, value in losses_generator.items()}
         # Tensorboard: add more metrics like psnr, ssim, etc.
         if writer is not None:
-            logger.log_tensorboard('val', losses, generated['prediction'].detach(), vaL_batch['driving'].detach(), epoch)
+            logger.log_tensorboard('val', losses, generated['prediction'][-1].detach(), vaL_batch['driving'].detach(), epoch)
 
     cross_input, out = Logger.cross_reenactment(val_loader, generator_full, device)
     save_path = os.path.join(logger.visualizations_dir, "%s-crossre.png" % str(epoch).zfill(logger.zfill_num))

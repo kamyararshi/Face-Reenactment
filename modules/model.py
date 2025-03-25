@@ -7,6 +7,7 @@ import numpy as np
 from torch.autograd import grad
 import modules.hopenet as hopenet
 from torchvision import transforms
+from torch.amp import autocast
 
 
 class Vgg19(torch.nn.Module):
@@ -286,6 +287,18 @@ def keypoint_transformation(kp_canonical, he, estimate_jacobian=True, add_expres
 
     return {'value': kp_transformed, 'jacobian': jacobian_transformed}
 
+def consistency_loss(motion_coarse, motion_fine):
+    # Upsample the coarse motion
+    motion_coarse_upsampled = F.interpolate(motion_coarse, size=motion_fine.shape[2:], mode='trilinear', align_corners=True)
+    diff = torch.abs(motion_coarse_upsampled - motion_fine)
+    return torch.mean(diff)
+
+def smoothness_loss(motion):
+    diff_d = torch.abs(motion[:, 1:, :, :, :] - motion[:, :-1, :, :, :])
+    diff_w = torch.abs(motion[:, :, :, 1:, :] - motion[:, :, :, :-1, :])
+    diff_h = torch.abs(motion[:, :, 1:, :, :] - motion[:, :, :-1, :, :])
+    return torch.mean(diff_d) + torch.mean(diff_h) + torch.mean(diff_w)
+
 class GeneratorFullModel(torch.nn.Module):
     """
     Merge all generator related updates into single model for better multi-gpu usage
@@ -336,7 +349,8 @@ class GeneratorFullModel(torch.nn.Module):
         kp_source = keypoint_transformation(kp_canonical, he_source, self.estimate_jacobian, add_expression=add_expression)
         kp_driving = keypoint_transformation(kp_canonical, he_driving, self.estimate_jacobian, add_expression=add_expression)
 
-        generated = self.generator(x['source'], x['driving'], kp_source=kp_source, kp_driving=kp_driving, rec_driving=rec_driving) #TODO: feature_3d volume both for xs and xd are added to the output
+        generated = self.generator(x['source'], x['driving'], kp_source=kp_source, kp_driving=kp_driving,
+                                   fmap_source=kp_canonical['feature_map'], fmap_driving=kp_canonical_d['feature_map'], rec_driving=rec_driving)
         generated.update({'kp_source': kp_source, 'kp_driving': kp_driving})
 
         loss_values = {}
@@ -391,6 +405,20 @@ class GeneratorFullModel(torch.nn.Module):
                         value_total += self.loss_weights['feature_matching'][i] * value
                     loss_values['feature_matching'] = value_total
 
+        #TODO: Add loss for the motion iterations according to RAFT and Unsupervised OF
+        if len(generated['deformation'])>1:
+            if self.loss_weights['motion_consistency'] != 0:
+                num = len(generated['deformation'])-1
+                loss_values['motion_consistency'] = \
+                    self.loss_weights['motion_consistency'] * \
+                sum([
+                    consistency_loss(f1, f2) for f1,f2 in zip(generated['deformation'][:-1], generated['deformation'][1:])
+                    ])/num
+            
+            if self.loss_weights['motion_smoothness'] != 0:
+                loss_values['motion_smoothness'] = \
+                    self.loss_weights['motion_smoothness'] * \
+                        sum(smoothness_loss(motion) for motion in generated['deformation'])/(num+1)
 
         #NOTE: for consistent expression-free Rotation-free canonical keypoints
         if self.loss_weights['canonicalkp_consistency'] != 0:
@@ -444,24 +472,25 @@ class GeneratorFullModel(torch.nn.Module):
                 loss_values['equivariance_jacobian'] = self.loss_weights['equivariance_jacobian'] * value
 
         if self.loss_weights['keypoint'] != 0:
-            # Compute pairwise distances for all pairs of keypoints at once
             kp_values = kp_driving['value']
-            # batch_size, num_keypoints, _ = kp_values.shape
+            batch_size, num_kp, _ = kp_values.shape
 
-            # Reshape to enable broadcasting for pairwise distance calculation
-            kp_values_i = kp_values.unsqueeze(2)  # Shape: (bs, k, 1, 3)
-            kp_values_j = kp_values.unsqueeze(1)  # Shape: (bs, 1, k, 3)
+            # 1.Pairwise distance component
+            # Reshape for broadcasting
+            kp_a = kp_values.unsqueeze(2)  # Shape: [batch_size, num_kp, 1, 3]
+            kp_b = kp_values.unsqueeze(1)  # Shape: [batch_size, 1, num_kp, 3]
+            # Calculate squared distances
+            squared_dist = torch.sum((kp_a - kp_b) ** 2, dim=-1)  # [batch_size, num_kp, num_kp]
             
-            # Calculate squared Euclidean distances between all pairs (bs, k, k)
-            dist_matrix = F.pairwise_distance(kp_values_i, kp_values_j, p=2).pow(2)
+            # Apply threshold operation (Dt = 0.1)
+            dist_transformed = 0.1 - squared_dist
+            mask = torch.gt(dist_transformed, 0)
+            # NOTE: Take mean of each pair separately, then sum
+            masked_values = dist_transformed * mask
+            pair_means = masked_values.mean(dim=0)  # Mean across batch dimension for each pair
+            value_total = pair_means.sum()  # Sum all pair means
 
-            # Apply the threshold and mask
-            dist_matrix = 0.1 - dist_matrix
-            mask = dist_matrix > 0
-            value_matrix = dist_matrix * mask  # Only keep values where distance is positive
-            value_total = value_matrix.mean(dim=(1, 2))  # Average over keypoint pairs in each batch
-
-            # Depth component
+            # 2.Depth component
             kp_mean_depth = kp_values[:, :, -1].mean(dim=-1)
             value_depth = torch.abs(kp_mean_depth - 0.33).mean()
 

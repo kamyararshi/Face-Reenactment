@@ -4,7 +4,7 @@ dataset_params:
   id_sampling: False
   pairs_list: None
   use_augmentation: True # For now let's see how it will do without augmentation
-  dataset_amount: 100
+  dataset_amount: null
   augmentation_params:
     flip_param:
       horizontal_flip: True
@@ -51,13 +51,20 @@ model_params:
       # reshape_channel: 32
       reshape_depth: 16
       compress: 4
-    expression_enc_params:
-      projection_dim: 128
-      in_channel: 512
-      d_model: 128
-      encode_feat: True
-      encode_src: True
-      encode_drv: True
+    motion_refiner_params:
+      # normal #small
+      hidden_dim: 32 #96
+      corr_levels: 1 #4
+      corr_radius: 3 #3
+      context_dim: 32 #64
+      context_params:
+        block_expansion: 32
+        image_channel: 3
+        reshape_channel: 16384  # 16384 = 1024 * 16
+        reshape_depth: 16
+        num_blocks: 5
+        max_features: 1024
+        scale_factor: 0.125
   discriminator_params:
     scales: [1]
     block_expansion: 32                 
@@ -74,7 +81,7 @@ train_params:
   lr_kp_detector: 2.0e-4
   lr_he_estimator: 2.0e-4
   gan_mode: 'hinge'    # hinge or ls
-  batch_size: 10
+  batch_size: 6
   scales: [1, 0.5, 0.25, 0.125]
   checkpoint_freq: 10
   hopenet_snapshot: 'config/checkpoints/hopenet_robust_alpha1.pkl'
@@ -91,6 +98,8 @@ train_params:
       l1: 0 #10
     canonicalkp_consistency: 0 #5
     feature_3d_consistency: 0 #5
+    motion_consistency: 0 #5
+    motion_smoothness: 0 #5
     equivariance_value: 10
     equivariance_jacobian: 0    # 10
     keypoint: 10

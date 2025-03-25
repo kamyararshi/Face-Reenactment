@@ -2,6 +2,7 @@ from torch import nn
 import torch.nn.functional as F
 import torch
 from modules.util import Hourglass, SPADEResnetBlock3D, make_coordinate_grid, kp2gaussian
+from modules.util import mesh_grid, norm_grid
 
 from sync_batchnorm import SynchronizedBatchNorm3d as BatchNorm3d
 
@@ -117,12 +118,12 @@ class DenseMotionInit(nn.Module):
                  estimate_occlusion_map=False):
         super(DenseMotionInit, self).__init__()
 
-        # self.compress = nn.Conv3d(feature_channel, compress, kernel_size=1)
-        # self.norm = BatchNorm3d(compress, affine=True)
+        self.compress = nn.Conv3d(feature_channel, compress, kernel_size=1)
+        self.norm = BatchNorm3d(compress, affine=True)
 
         if estimate_occlusion_map:
-            # self.occlusion = nn.Conv2d(reshape_channel*reshape_depth, 1, kernel_size=7, padding=3)
-            self.occlusion = nn.Conv2d(self.hourglass.out_filters*reshape_depth, 1, kernel_size=7, padding=3)
+            # self.occlusion = nn.Conv2d(compress*(num_kp+1)*reshape_depth, 1, kernel_size=7, padding=3)
+            self.occlusion = nn.Conv2d(compress*reshape_depth, 1, kernel_size=7, padding=3)
         else:
             self.occlusion = None
 
@@ -156,8 +157,8 @@ class DenseMotionInit(nn.Module):
 
     def create_heatmap_representations(self, feature, kp_driving, kp_source):
         spatial_size = feature.shape[3:]
-        gaussian_driving = kp2gaussian(kp_driving, spatial_size=spatial_size, kp_variance=0.01)
-        gaussian_source = kp2gaussian(kp_source, spatial_size=spatial_size, kp_variance=0.01)
+        gaussian_driving = kp2gaussian(kp_driving, spatial_size=spatial_size, kp_variance=0.1)
+        gaussian_source = kp2gaussian(kp_source, spatial_size=spatial_size, kp_variance=0.1)
         heatmap = gaussian_driving - gaussian_source
 
         # adding background feature
@@ -168,49 +169,38 @@ class DenseMotionInit(nn.Module):
 
     def forward(self, feature, kp_driving, kp_source):
         bs, _, d, h, w = feature.shape
+        feature = self.compress(feature)
+        feature = self.norm(feature)
+        feature = F.relu(feature)
 
         out_dict = dict()
         sparse_motion = self.create_sparse_motions(feature, kp_driving, kp_source)
-        deformed_feature = self.create_deformed_feature(feature, sparse_motion) #NOTE: Warps the feature with the sparse_motion
+        # deformed_feature = self.create_deformed_feature(feature, sparse_motion) #NOTE: Warps the feature with the sparse_motion
+        # deformed_feature = deformed_feature.contiguous().view(bs, -1, h, w)
 
-        heatmap = self.create_heatmap_representations(deformed_feature, kp_driving, kp_source)
+        # heatmap = self.create_heatmap_representations(deformed_feature, kp_driving, kp_source)
 
         # heatmap shape (bs, num_kp+1, 1, d, h, w)
         sparse_motion = sparse_motion.permute(0, 1, 5, 2, 3, 4)    # (bs, num_kp+1, 3, d, h, w)
-        deformation = (sparse_motion * heatmap).sum(dim=1)            # (bs, 3, d, h, w)
+        # deformation = (sparse_motion * heatmap).sum(dim=1)            # (bs, 3, d, h, w)
+        deformation = sparse_motion.mean(dim=1)            # (bs, 3, d, h, w)
         deformation = deformation.permute(0, 2, 3, 4, 1)           # (bs, d, h, w, 3)
 
         out_dict['deformation'] = deformation
 
         if self.occlusion:
-            bs, c, d, h, w = prediction.shape
-            prediction = prediction.view(bs, -1, h, w)
-            occlusion_map = torch.sigmoid(self.occlusion(prediction))
+            occlusion_map = torch.sigmoid(self.occlusion(feature.view(bs,-1,h,w)))
+            occlusion_map = torch.ones(bs, 1, h, w).to(feature.device)
             out_dict['occlusion_map'] = occlusion_map
 
         return out_dict
     
 
-#TODO: Replace this with our actual SPADE layer.
-class SPADE(nn.Module):
-    def __init__(self, in_channels, norm_nc, ks=3):
-        super().__init__()
-        self.norm = nn.BatchNorm3d(norm_nc, affine=False)
-        self.conv = nn.Conv3d(in_channels, 2*norm_nc, kernel_size=ks, padding=ks//2)
-
-    def forward(self, x, segmap):
-        normalized = self.norm(x)
-        segmap = F.interpolate(segmap, size=x.size()[2:], mode='nearest')
-        actv = self.conv(segmap)
-        gamma, beta = torch.chunk(actv, 2, dim=1)
-        out = normalized * (1 + gamma) + beta
-        return out
-
 class AttentionBlock(nn.Module):
-    def __init__(self, in_channels):
+    def __init__(self, in_channels, div):
         super().__init__()
-        self.q = nn.Conv3d(in_channels, in_channels // 8, kernel_size=1)
-        self.k = nn.Conv3d(in_channels, in_channels // 8, kernel_size=1)
+        self.q = nn.Conv3d(in_channels, in_channels // div, kernel_size=1)
+        self.k = nn.Conv3d(in_channels, in_channels // div, kernel_size=1)
         self.v = nn.Conv3d(in_channels, in_channels, kernel_size=1)
         self.gamma = nn.Parameter(torch.zeros(1))
 
@@ -228,39 +218,76 @@ class AttentionBlock(nn.Module):
 
         return self.gamma * out + x
 
-class MotionRefinementModule(nn.Module):
-    def __init__(self, feature_channels, corr_channels, motion_channels, label_nc, attention_channels):
-        super().__init__()
-        self.conv_corr = nn.Conv3d(corr_channels, attention_channels, kernel_size=3, padding=1)
-        self.attention = AttentionBlock(attention_channels)
-        self.conv_motion = nn.Conv3d(motion_channels, 32, kernel_size=3, padding=1)
-        self.spade_resnet = SPADEResnetBlock3D(feature_channels, 64, 'none', label_nc)
-        self.conv_residual = nn.Sequential(
-            nn.Conv3d(64 + 64 + 32, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Dropout3d(0.2),
-            nn.Conv3d(64, 3, kernel_size=3, padding=1),
-            nn.Tanh()
-        )
-        self.attention_channels = attention_channels
+class FlowHead3D(nn.Module):
+    def __init__(self, input_dim=32, hidden_dim=64):
+        super(FlowHead3D, self).__init__()
+        self.conv1 = nn.Conv3d(input_dim, hidden_dim, 3, padding=1)
+        self.conv2 = nn.Conv3d(hidden_dim, 3, 3, padding=1)  # Output 3 channels for 3D flow
+        self.relu = nn.ReLU(inplace=True)
 
-    def forward(self, feature, corr, motion, segmap):
-        feature = self.spade_resnet(feature, segmap)
-        corr = self.attention(self.conv_corr(corr))
-        motion = self.conv_motion(motion)
-        combined = torch.cat([feature, corr, motion], dim=1)
-        residual = self.conv_residual(combined)
-        return residual
+    def forward(self, x):
+        return self.conv2(self.relu(self.conv1(x)))
 
-class MultiScaleMotionRefinement(nn.Module):
-    def __init__(self, spade_channels):
-        super().__init__()
-        self.refinement_modules = nn.ModuleList([
-            MotionRefinementModule(32, 32*32*1, 3, spade_channels, 64),
-            MotionRefinementModule(64, 16*16*1, 3, spade_channels, 64),
-            MotionRefinementModule(128, 8*16*1, 3, spade_channels, 64),
-            MotionRefinementModule(256, 4*16*1, 3, spade_channels, 64)
-        ])
+class ConvGRU3D(nn.Module):
+    def __init__(self, hidden_dim=32, input_dim=32 + 64):
+        super(ConvGRU3D, self).__init__()
+        self.convz = nn.Conv3d(hidden_dim + input_dim, hidden_dim, 3, padding=1)
+        self.convr = nn.Conv3d(hidden_dim + input_dim, hidden_dim, 3, padding=1)
+        self.convq = nn.Conv3d(hidden_dim + input_dim, hidden_dim, 3, padding=1)
 
-    def forward(self, features, corrs, motions, segmaps, scale: int):
-        return self.refinement_modules[scale](features, corrs, motions, segmaps)
+    def forward(self, h, x):
+        hx = torch.cat([h, x], dim=1)
+
+        z = torch.sigmoid(self.convz(hx))
+        r = torch.sigmoid(self.convr(hx))
+        q = torch.tanh(self.convq(torch.cat([r * h, x], dim=1)))
+
+        h = (1 - z) * h + z * q
+        return h
+
+class MotionEncoder3D(nn.Module):
+    def __init__(self, args):
+        super(MotionEncoder3D, self).__init__()
+        cor_planes = args.corr_levels * (2 * args.corr_radius + 1) ** 3  # Corrected for 3D
+        self.convc1 = nn.Conv3d(cor_planes, 256, 1, padding=0)
+        self.convc2 = nn.Conv3d(256, 128, 3, padding=1)
+        self.convf1 = nn.Conv3d(3, 128, 7, padding=3)  # Input 3 channels for 3D flow
+        self.convf2 = nn.Conv3d(128, 64, 3, padding=1)
+        self.conv = nn.Conv3d(64 + 128, 64 - 3, 3, padding=1)  # Adjusted output channels
+
+    def forward(self, flow, corr):
+        cor = F.relu(self.convc1(corr))
+        cor = F.relu(self.convc2(cor))
+        flo = F.relu(self.convf1(flow))
+        flo = F.relu(self.convf2(flo))
+
+        cor_flo = torch.cat([cor, flo], dim=1)
+        out = F.relu(self.conv(cor_flo))
+        return torch.cat([out, flow], dim=1)
+
+class UpdateBlock3D(nn.Module):
+    def __init__(self, args, hidden_dim=32):
+        super(UpdateBlock3D, self).__init__()
+        self.args = args
+        self.encoder = MotionEncoder3D(args) # 64 channel out
+        self.gru = ConvGRU3D(hidden_dim=hidden_dim, input_dim=hidden_dim + self.encoder.conv.out_channels + 3)
+        self.flow_head = FlowHead3D(hidden_dim, hidden_dim=64)
+        
+        #TODO: Mask in the original RAFT
+
+    def forward(self, net, inp, corr, flow):
+        motion_features = self.encoder(flow, corr)
+        inp = torch.cat([inp, motion_features], dim=1) # 32 + 64
+
+        net = self.gru(net, inp) #32, 64+32
+        delta_flow = self.flow_head(net)
+
+        return net, delta_flow
+
+
+class Args:
+    def __init__(self, corr_radius, corr_levels, hidden_dim, context_dim, context_params) -> None:
+        self.corr_radius = corr_radius
+        self.corr_levels = corr_levels
+        self.hidden_dim = hidden_dim
+        self.context_dim = context_dim

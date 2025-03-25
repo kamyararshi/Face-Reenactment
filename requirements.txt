@@ -1,0 +1,17 @@
+einops
+gdown
+imageio
+ipykernel
+matplotlib
+numpy
+pandas
+PyYAML
+scikit-image
+scikit-learn
+scipy
+tensorboard
+tensorboardX
+torch-fidelity
+torchmetrics
+tornado
+tqdm

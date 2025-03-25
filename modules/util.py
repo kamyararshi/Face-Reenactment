@@ -9,24 +9,51 @@ from sync_batchnorm import SynchronizedBatchNorm3d as BatchNorm3d
 import torch.nn.utils.spectral_norm as spectral_norm
 import re
 
-def corr3d(fmap1, fmap2):
-    """Computes correlation between 3D feature maps."""
-    batch, dim, depth, height, width = fmap1.shape
 
-    # Reshape fmap1 and fmap2 for matrix multiplication
-    fmap1_flat = fmap1.view(batch, dim, depth * height * width)
-    fmap2_flat = fmap2.view(batch, dim, depth * height * width)
+def coords_grid(batch, d, ht, wd, device):
+    coords = torch.meshgrid(
+        torch.arange(d, device=device),
+        torch.arange(ht, device=device),
+        torch.arange(wd, device=device),
+                            )
+    coords = torch.stack(coords[::-1], dim=0).float()
+    return coords[None].repeat(batch, 1, 1, 1, 1)
 
-    # Compute correlation using matrix multiplication
-    correlation = torch.matmul(fmap1_flat.transpose(1, 2), fmap2_flat)
+def trilinear_sampler(img, coords, mask=False):
+    """
+    Trilinear sampling for 3D correlation volumes
+    """
+    b, c, dd, hh, ww = img.shape
+    w_coords, h_coords, d_coords = coords[..., 0], coords[..., 1], coords[..., 2]
+    
+    w_coords = 2 * w_coords / (ww - 1) - 1
+    h_coords = 2 * h_coords / (hh - 1) - 1
+    d_coords = 2 * d_coords / (dd - 1) - 1
+    
+    grid = torch.stack([w_coords, h_coords, d_coords], dim=-1).to(img.dtype)
+    img = F.grid_sample(img, grid, align_corners=True, mode='bilinear') 
 
-    # Reshape correlation back to the desired output shape
-    correlation = correlation.view(batch, depth, height, width, 1, depth, height, width)
+    if mask:
+        mask = (d_coords > -1) & (h_coords > -1) & (w_coords > -1) & (d_coords < 1) & (h_coords < 1) & (w_coords < 1)
+        return img, mask.float()
+    
+    return img
 
-    # Normalize by the square root of the dimension
-    correlation = correlation / torch.sqrt(torch.tensor(dim, dtype=torch.float32))
+def bilinear_sampler(img, coords, mode='bilinear', mask=False):
+    """ Wrapper for grid_sample, uses pixel coordinates """
+    H, W = img.shape[-2:]
+    xgrid, ygrid = coords.split([1,1], dim=-1)
+    xgrid = 2*xgrid/(W-1) - 1
+    ygrid = 2*ygrid/(H-1) - 1
 
-    return correlation
+    grid = torch.cat([xgrid, ygrid], dim=-1)
+    img = F.grid_sample(img, grid, align_corners=True)
+
+    if mask:
+        mask = (xgrid > -1) & (ygrid > -1) & (xgrid < 1) & (ygrid < 1)
+        return img, mask.float()
+
+    return img
 
 def kp2gaussian(kp, spatial_size, kp_variance):
     """
@@ -376,16 +403,19 @@ class Hourglass(nn.Module):
         return self.decoder(self.encoder(x))
 
 
-class KPHourglass(nn.Module):
+class AttentionKPHourglass(nn.Module):
     """
     Hourglass architecture.
     """ 
 
     def __init__(self, block_expansion, in_features, reshape_features, reshape_depth, num_blocks=3, max_features=256):
-        super(KPHourglass, self).__init__()
+        super(AttentionKPHourglass, self).__init__()
         
         self.down_blocks = nn.Sequential()
+        self.attention = nn.Sequential()
         for i in range(num_blocks):
+            #TODO: Maybe only one layer attention at the end or only at the beginning?
+            # self.attention.add_module('attention'+ str(i), AttentionBlock2D(in_features if i == 0 else min(max_features, block_expansion * (2 ** i))))
             self.down_blocks.add_module('down'+ str(i), DownBlock2d(in_features if i == 0 else min(max_features, block_expansion * (2 ** i)),
                                                                    min(max_features, block_expansion * (2 ** (i + 1))),
                                                                    kernel_size=3, padding=1))
@@ -403,6 +433,50 @@ class KPHourglass(nn.Module):
         self.out_filters = out_filters
 
     def forward(self, x):
+        for i in range(len(self.down_blocks)):
+            # x = self.attention[i](x)
+            x = self.down_blocks[i](x)
+        
+        out = self.conv(x)
+        bs, c, h, w = out.shape
+        out = out.view(bs, c//self.reshape_depth, self.reshape_depth, h, w)
+        out = self.up_blocks(out)
+
+        return out
+    
+
+class ContextHourglass(nn.Module):
+    """
+    Hourglass architecture.
+    """ 
+
+    def __init__(self, block_expansion, image_channel, scale_factor, reshape_channel, reshape_depth, out_features, num_blocks=3, max_features=256):
+        super(ContextHourglass, self).__init__()
+        
+        if scale_factor != 1:
+            self.down = AntiAliasInterpolation2d(image_channel, scale_factor)
+            in_features = image_channel
+
+        self.down_blocks = nn.Sequential()
+        for i in range(num_blocks):
+            self.down_blocks.add_module('down'+ str(i), DownBlock2d(in_features if i == 0 else min(max_features, block_expansion * (2 ** i)),
+                                                                   min(max_features, block_expansion * (2 ** (i + 1))),
+                                                                   kernel_size=3, padding=1))
+
+        in_filters = min(max_features, block_expansion * (2 ** num_blocks))
+        self.conv = nn.Conv2d(in_channels=in_filters, out_channels=reshape_channel, kernel_size=1)
+
+        self.up_blocks = nn.Sequential()
+        for i in range(num_blocks):
+            in_filters = min(max_features, block_expansion * (2 ** (num_blocks - i)))
+            out_filters = out_features if i==num_blocks-1 else min(max_features, block_expansion * (2 ** (num_blocks - i - 1)))
+            self.up_blocks.add_module('up'+ str(i), UpBlock3d(in_filters, out_filters, kernel_size=3, padding=1))
+
+        self.reshape_depth = reshape_depth
+        self.out_filters = out_filters
+
+    def forward(self, x):
+        x = self.down(x)
         out = self.down_blocks(x)
         out = self.conv(out)
         bs, c, h, w = out.shape
@@ -412,6 +486,29 @@ class KPHourglass(nn.Module):
         return out
         
 
+class AttentionBlock2D(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        out_qk = in_channels // 8 if in_channels // 8 > 0 else 1
+        self.q = nn.Conv2d(in_channels, out_qk, kernel_size=1)
+        self.k = nn.Conv2d(in_channels, out_qk, kernel_size=1)
+        self.v = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        batch, c, h, w = x.size()
+        q = self.q(x).view(batch, -1, h * w).permute(0, 2, 1)
+        k = self.k(x).view(batch, -1, h * w)
+        v = self.v(x).view(batch, -1, h * w)
+
+        attn = torch.bmm(q, k)
+        attn = F.softmax(attn, dim=-1)
+
+        out = torch.bmm(attn, v.permute(0, 2, 1))
+        out = out.view(batch, -1, h, w)
+
+        return self.gamma * out + x
+    
 
 class AntiAliasInterpolation2d(nn.Module):
     """

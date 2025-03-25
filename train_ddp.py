@@ -9,7 +9,7 @@ from torch.optim.lr_scheduler import MultiStepLR
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, get_rank, destroy_process_group
 from torch.utils.data.distributed import DistributedSampler
-# import torchmetrics #TODO: Install this and use it for metrics
+from torch.amp import GradScaler
 
 from torch.utils.data import DataLoader
 
@@ -53,8 +53,8 @@ def train(rank: int, world_size: int, config: dict,
 
     if 'num_repeats' in train_params or train_params['num_repeats'] != 1:
         dataset = DatasetRepeater(dataset, train_params['num_repeats'])
-    dataloader = DataLoader(dataset, batch_size=train_params['batch_size'], shuffle=False, num_workers=16, drop_last=False, sampler=DistributedSampler(dataset))
-    val_loader = DataLoader(val_dataset, batch_size=train_params['batch_size'], shuffle=False, num_workers=16, sampler=DistributedSampler(val_dataset))
+    dataloader = DataLoader(dataset, batch_size=train_params['batch_size'], shuffle=False, num_workers=0, drop_last=False, sampler=DistributedSampler(dataset))
+    val_loader = DataLoader(val_dataset, batch_size=train_params['batch_size'], shuffle=False, num_workers=0, sampler=DistributedSampler(val_dataset))
 
     generator_full = GeneratorFullModel(kp_detector, he_estimator, generator, discriminator, train_params, estimate_jacobian=config['model_params']['common_params']['estimate_jacobian'], device=device).to(device)
     generator_full = DDP(generator_full, device_ids=[device], find_unused_parameters=True) # Wrap the model with DDP
@@ -63,25 +63,28 @@ def train(rank: int, world_size: int, config: dict,
 
     # Tensorboard
     writer = SummaryWriter(f'{log_dir}/runs/') if writer and rank==0 else None
+    # Grad Scaler
+    # scaler = GradScaler(opt.mixed_precission)
 
     with Logger(log_dir=log_dir, visualizer_params=config['visualizer_params'], checkpoint_freq=train_params['checkpoint_freq'], writer=writer, ddp=True) as logger:
         for epoch in trange(start_epoch, train_params['num_epochs'], initial=start_epoch, total=train_params['num_epochs']):
+            generator_full.train()
             for x in tqdm(dataloader):
+                optimizer_generator.zero_grad()
+                optimizer_kp_detector.zero_grad()
+                optimizer_he_estimator.zero_grad()
+
                 global_epoch += 1
                 x = {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in x.items()}
-                generator_full.train()
-                losses_generator, generated = generator_full(x, add_expression=opt.add_expr, rec_driving=opt.rec_driv) #TODO: add_expressions=False is used to avoid the expression loss
-
+                losses_generator, generated = generator_full(x, add_expression=opt.add_expr, rec_driving=opt.rec_driv)
                 loss_values = [val.mean() for val in losses_generator.values()]
                 loss = sum(loss_values)
 
                 loss.backward()
                 optimizer_generator.step()
-                optimizer_generator.zero_grad()
                 optimizer_kp_detector.step()
-                optimizer_kp_detector.zero_grad()
                 optimizer_he_estimator.step()
-                optimizer_he_estimator.zero_grad()
+                # nn.utils.clip_grad_norm_(generator_full.parameters(), 1.0)                
 
                 if train_params['loss_weights']['generator_gan'] != 0:
                     optimizer_discriminator.zero_grad()
@@ -91,7 +94,7 @@ def train(rank: int, world_size: int, config: dict,
 
                     loss.backward(retain_graph=False)
                     optimizer_discriminator.step()
-                    optimizer_discriminator.zero_grad()
+                    # nn.utils.clip_grad_norm_(discriminator_full.parameters(), 1.0)
                 else:
                     losses_discriminator = {}
 
@@ -102,7 +105,7 @@ def train(rank: int, world_size: int, config: dict,
                     logger.log_scores(logger.names)
                     # Tensorboard TODO: Add more metrics like psnr, ssim, etc.
                     if writer is not None:
-                        logger.log_tensorboard('train', losses, generated['prediction'][-1].detach(), x['driving'].detach(), global_epoch)
+                        logger.log_tensorboard('train', losses, generated['prediction'][-1].detach().float(), x['driving'].detach().float(), global_epoch)
 
             scheduler_generator.step()
             scheduler_discriminator.step()
@@ -119,7 +122,7 @@ def train(rank: int, world_size: int, config: dict,
                                         'optimizer_discriminator': optimizer_discriminator,
                                         'optimizer_kp_detector': optimizer_kp_detector,
                                         'optimizer_he_estimator': optimizer_he_estimator}, inp=x, out=generated)
-        
+            
                 # Validation
                 _ = run_validation(generator_full, val_loader, device, epoch, logger, writer)
 

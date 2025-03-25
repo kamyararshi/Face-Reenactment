@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 
 from sync_batchnorm import SynchronizedBatchNorm2d as BatchNorm2d
-from modules.util import KPHourglass, make_coordinate_grid, AntiAliasInterpolation2d, ResBottleneck
+from modules.util import AttentionKPHourglass, make_coordinate_grid, AntiAliasInterpolation2d, ResBottleneck
 
 
 class KPDetector(nn.Module):
@@ -15,10 +15,10 @@ class KPDetector(nn.Module):
                  num_blocks, temperature, estimate_jacobian=False, scale_factor=1, single_jacobian_map=False):
         super(KPDetector, self).__init__()
 
-        self.predictor = KPHourglass(block_expansion, in_features=image_channel,
+        self.predictor = AttentionKPHourglass(block_expansion, in_features=image_channel,
                                      max_features=max_features,  reshape_features=reshape_channel, reshape_depth=reshape_depth, num_blocks=num_blocks)
 
-        # self.kp = nn.Conv3d(in_channels=self.predictor.out_filters, out_channels=num_kp, kernel_size=7, padding=3)
+        self.corr_fmap = nn.AvgPool3d(kernel_size=3, stride=(1,2,2), padding=1)
         self.kp = nn.Conv3d(in_channels=self.predictor.out_filters, out_channels=num_kp, kernel_size=3, padding=1)
 
         if estimate_jacobian:
@@ -66,6 +66,7 @@ class KPDetector(nn.Module):
         heatmap = heatmap.view(*final_shape)
 
         out = self.gaussian2kp(heatmap)
+        out['feature_map'] = self.corr_fmap(feature_map)
 
         if self.jacobian is not None:
             jacobian_map = self.jacobian(feature_map)

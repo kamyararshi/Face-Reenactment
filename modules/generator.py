@@ -2,12 +2,166 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from modules.util import ResBlock2d, SameBlock2d, UpBlock2d, DownBlock2d, ResBlock3d, SPADEResnetBlock, ContextHourglass, coords_grid
-from modules.dense_motion import DenseMotionInit, DenseMotionNetwork, UpdateBlock3D, Args
+from modules.dense_motion import DenseMotionInit, DenseMotionNetwork, DenseMotionNetworkUpdater, UpdateBlock3D, Args
 from modules.corr import CorrBlock3D
 from torch.amp import autocast
 
 
 class OcclusionAwareGenerator(nn.Module):
+    """
+    Generator for motion refinement and occlusion aware generation.
+    """
+
+    def __init__(self, image_channel, feature_channel, num_kp, block_expansion, max_features, num_down_blocks, reshape_channel, reshape_depth,
+                 num_resblocks, estimate_occlusion_map=False, dense_motion_params=None, estimate_jacobian=False):
+        super(OcclusionAwareGenerator, self).__init__()
+
+        if dense_motion_params is not None:
+            self.dense_motion_initalizer = DenseMotionNetworkUpdater(num_kp=num_kp, feature_channel=feature_channel,
+                                                           estimate_occlusion_map=estimate_occlusion_map,
+                                                           **dense_motion_params)
+        else:
+            self.dense_motion_network = None
+
+        
+        self.first = SameBlock2d(image_channel, block_expansion, kernel_size=(7, 7), padding=(3, 3))
+
+        down_blocks = []
+        in_features = [] # for upblocks
+        out_features = [] # for upblocks
+        self.num_down_blocks = num_down_blocks
+        for i in range(num_down_blocks):
+            in_feature = min(max_features, block_expansion * (2 ** i))
+            out_feature = min(max_features, block_expansion * (2 ** (i + 1)))
+            in_features.append(out_feature)
+            out_features.append(in_feature)
+            down_blocks.append(DownBlock2d(in_feature, out_feature, kernel_size=(3, 3), padding=(1, 1)))
+        self.down_blocks = nn.ModuleList(down_blocks)
+
+        up_blocks = []
+        in_features = in_features[::-1] # Reverse the order for upblocks
+        out_features = out_features[::-1] # Reverse the order for upblocks
+        for i in range(num_down_blocks):
+            up_blocks.append(UpBlock2d(in_features[i], out_features[i], kernel_size=(3, 3), padding=(1, 1)))
+        self.up_blocks = nn.ModuleList(up_blocks)
+        
+        resblock = []
+        for i in range(num_down_blocks):
+            resblock.append(ResBlock2d(in_features[i], kernel_size=(3, 3), padding=(1, 1)))
+            resblock.append(ResBlock2d(in_features[i], kernel_size=(3, 3), padding=(1, 1)))
+        self.resblock = nn.ModuleList(resblock)
+
+        self.reshape_channel = reshape_channel
+        self.reshape_depth = reshape_depth
+        
+        self.resblocks_3d = torch.nn.Sequential()
+        for i in range(num_resblocks):
+            self.resblocks_3d.add_module('3dr' + str(i), ResBlock3d(reshape_channel, kernel_size=3, padding=1))
+        
+
+        self.predict_image = nn.ModuleList()
+        for in_channel in [512, 256, 128, 64]:
+            self.predict_image.append(self._buil_predictor(in_channel))
+
+        self.estimate_occlusion_map = estimate_occlusion_map
+        self.image_channel = image_channel
+
+    def _buil_predictor(self, in_channels, image_channel=3):
+        return nn.Sequential(*[
+                nn.Conv2d(in_channels, image_channel, kernel_size=(7, 7), padding=(3, 3)),
+                nn.Sigmoid()
+                ])
+
+    def deform_input(self, inp, deformation):
+        _, d_old, h_old, w_old, _ = deformation.shape
+        _, _, d, h, w = inp.shape
+        if d_old != d or h_old != h or w_old != w:
+            deformation = deformation.permute(0, 4, 1, 2, 3) # (bs, d, h, w, 3) -> (bs, 3, d, h, w)
+            deformation = F.interpolate(deformation, size=(d, h, w), mode='trilinear')
+            deformation = deformation.permute(0, 2, 3, 4, 1) # (bs, 3, d, h, w) -> (bs, d, h, w, 3)
+        return F.grid_sample(inp, deformation)
+    
+    def up_motion(self, motion, mode='trilinear'): 
+        return  2 * F.interpolate(motion, size=(2 * motion.shape[2], 2 * motion.shape[3], motion.shape[4]),
+                                  mode=mode, align_corners=True)
+
+    def initialize_flow(self, img):
+        """ Flow is represented as difference between two coordinate grids flow = coords1 - coords0"""
+        N, C, D, H, W = img.shape
+        coords0 = coords_grid(N, D, H, W, device=img.device)
+        coords1 = coords_grid(N, D, H, W, device=img.device)
+        # optical flow computed as difference: flow = coords1 - coords0
+        return coords0, coords1
+    
+    def occlude_input(self, inp, occlusion_map, inverse=False):
+        if inp.shape[2] != occlusion_map.shape[2] or inp.shape[3] != occlusion_map.shape[3]:
+            occlusion_map = F.interpolate(occlusion_map, size=inp.shape[2:], mode='bilinear',align_corners=True)
+        if inverse:
+            occlusion_map = 1 - occlusion_map
+        out = inp * occlusion_map
+        return out
+    
+    def forward(self, source_image, driving_image, kp_driving, kp_source, rec_driving=False):
+        output_dict = {}
+
+        # Encoding (downsampling) part
+        out = self.first(source_image)
+        encoder_map = [out]
+
+        for i in range(len(self.down_blocks)):
+            out = self.down_blocks[i](out)
+            encoder_map.append(out)
+        encoder_map = list(reversed(encoder_map))
+        bs, c, h, w = out.shape
+        
+        feature_3d = out.view(bs, self.reshape_channel, self.reshape_depth, h, w)
+        feature_3d = self.resblocks_3d(feature_3d)
+
+        # Transforming feature representation according to deformation and occlusion
+        dense_motion_init = self.dense_motion_initalizer(feature=feature_3d, kp_driving=kp_driving,
+                                                    kp_source=kp_source)
+
+        if 'mask' in dense_motion_init:
+            output_dict['mask'] = dense_motion_init['mask']
+        motion = dense_motion_init['deformation']
+        occlusion_map = dense_motion_init['occlusion_map']
+        output_dict.update({'sparse_motion': dense_motion_init['sparse_motion'], 'heatmap': dense_motion_init['heatmap']})
+                
+        feature_3d_deformed = self.deform_input(feature_3d, motion)
+        bs, c, d, h, w = feature_3d_deformed.shape
+        out = feature_3d_deformed.view(bs, c*d, h, w)
+        out = self.occlude_input(out, occlusion_map, inverse=False)
+        
+        prediction = self.predict_image[0](out)
+        output_dict['deformation'] = [motion]
+        output_dict['occlusion_map'] = [occlusion_map]
+        output_dict["prediction"] = [prediction]
+
+        for i in range(len(self.up_blocks)):
+            # Up blocks
+            out = self.resblock[2*i](out)
+            out = self.resblock[2*i+1](out)
+            # out = self.occlude_input(out, occlusion_map, inverse=False)
+            # encoder_out = self.occlude_input(encoder_map[i], occlusion_map, inverse=True)
+             #TODO: Start training with above commented modifications (occlusion map in upsampling on encoder_map and out)
+            out = self.up_blocks[i](out+encoder_map[i])
+            out = self.occlude_input(out, occlusion_map)
+            
+            # Predict image at scale
+            prediction = self.predict_image[i+1](out)
+            output_dict["prediction"].append(prediction)
+
+
+        if rec_driving:
+            #TODO: Adapt this to the new encoders and decoders
+            out = self.first(driving_image)
+            NotImplementedError("This part is not implemented yet")
+        else:
+            output_dict["driving_rec"] = None
+
+        return output_dict
+
+class OcclusionAwareGeneratorRAFT(nn.Module):
     """
     Generator follows NVIDIA architecture.
     """

@@ -17,7 +17,7 @@ from logger import Logger
 from modules.model import GeneratorFullModel, DiscriminatorFullModel
 from frames_dataset import DatasetRepeater
 
-def ddp_setup(rank: int, world_size: int, backend: str='nccl', MASTER_ADDR: str='localhost', MASTER_PORT: str='12366') -> None:
+def ddp_setup(rank: int, world_size: int, backend: str='nccl', MASTER_ADDR: str='localhost', MASTER_PORT: str='12367') -> None:
     import os
     os.environ['MASTER_ADDR'] = MASTER_ADDR # Change this to the IP of the master node
     os.environ['MASTER_PORT'] = MASTER_PORT # Random free port

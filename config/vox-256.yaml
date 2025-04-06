@@ -51,20 +51,6 @@ model_params:
       # reshape_channel: 32
       reshape_depth: 16
       compress: 4
-    motion_refiner_params:
-      # normal #small
-      hidden_dim: 32 #96
-      corr_levels: 1 #4
-      corr_radius: 3 #3
-      context_dim: 32 #64
-      context_params:
-        block_expansion: 32
-        image_channel: 3
-        reshape_channel: 16384  # 16384 = 1024 * 16
-        reshape_depth: 16
-        num_blocks: 5
-        max_features: 1024
-        scale_factor: 0.125
   discriminator_params:
     scales: [1]
     block_expansion: 32                 
@@ -81,7 +67,7 @@ train_params:
   lr_kp_detector: 2.0e-4
   lr_he_estimator: 2.0e-4
   gan_mode: 'hinge'    # hinge or ls
-  batch_size: 6
+  batch_size: 16
   scales: [1, 0.5, 0.25, 0.125]
   checkpoint_freq: 10
   hopenet_snapshot: 'config/checkpoints/hopenet_robust_alpha1.pkl'

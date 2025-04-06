@@ -3,6 +3,7 @@ from torchvision import transforms
 from torchvision import models
 import modules.hopenet as hopenet
 from modules.model import headpose_pred_to_degree
+from modules.utils_flow import flow_to_image
 
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -10,6 +11,59 @@ from collections import defaultdict
 import pickle
 import csv
 
+
+def get_statistics(motion: torch.Tensor):
+    motion = motion.squeeze(0).cpu().numpy()
+    return {
+        'mean': motion.mean(),
+        'std': motion.std(),
+        'min': motion.min(),
+        'max': motion.max()
+    }
+    
+def plot_motion_histogram(motion: torch.Tensor):
+    motion = motion.squeeze(0).cpu().numpy()
+    plt.hist(motion.flatten(), bins=100)
+    plt.show()
+
+def plot_flow_pair(flow):
+    flow = flow[0].mean(0).permute(2,0,1)
+    flows={}
+    flows['1'] = flow_to_image(flow[[0,1]]) 
+    flows['2'] = flow_to_image(flow[[0,2]]) 
+    flows['3'] = flow_to_image(flow[[1,2]]) 
+    flows['4'] = flow_to_image(flow[[1,0]])
+    flows['5'] = flow_to_image(flow[[2,0]]) 
+    flows['6'] = flow_to_image(flow[[2,1]])
+    fig, axs = plt.subplots(1,len(flows.keys()))
+    for i in range(len(flows.keys())):
+        axs[i].imshow(flows[str(i+1)].permute(1,2,0))
+        axs[i].axis('off')
+
+def plot_flow(flow):
+    batch_size = flow.shape[0]
+    num_flow = flow.shape[1]
+    fig, axs = plt.subplots(batch_size, num_flow, figsize=(20, 20), squeeze=False)
+    for i in range(batch_size):
+        for j in range(num_flow):
+            flow_color = flow_to_image(flow[i][j].detach().cpu().permute(2,0,1)[:2]).numpy().transpose(1,2,0)
+            axs[i, j].imshow(flow_color)
+            axs[i, j].axis('off')
+            
+def plot_all_hists(motions):
+    fig, axs = plt.subplots(4,4, figsize=(20,20))
+    z = 0
+    for i in range(4):
+        for j in range(4):
+            motion = motions[:,z].squeeze(0).cpu().numpy()
+            axs[i,j].hist(motion.flatten(), bins=100)
+            # add statistics as title
+            stats = get_statistics(motions[:,z])
+            axs[i,j].set_title(f"mean: {stats['mean']:.2f}, std: {stats['std']:.2f}, max: {stats['max']:.2f}, min: {stats['min']:.2f}")
+            z += 1
+    plt.show()
+    
+    
 class RotationHistogram:
     def __init__(self, hopenet_snapshot: str, num_bins: int=50, device: str="cuda"):
         """

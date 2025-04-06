@@ -349,8 +349,8 @@ class GeneratorFullModel(torch.nn.Module):
         kp_source = keypoint_transformation(kp_canonical, he_source, self.estimate_jacobian, add_expression=add_expression)
         kp_driving = keypoint_transformation(kp_canonical, he_driving, self.estimate_jacobian, add_expression=add_expression)
 
-        generated = self.generator(x['source'], x['driving'], kp_source=kp_source, kp_driving=kp_driving,
-                                   fmap_source=kp_canonical['feature_map'], fmap_driving=kp_canonical_d['feature_map'], rec_driving=rec_driving)
+        generated = self.generator(x['source'], x['driving'], kp_source=kp_source,
+                                   kp_driving=kp_driving, rec_driving=rec_driving)
         generated.update({'kp_source': kp_source, 'kp_driving': kp_driving})
 
         loss_values = {}
@@ -374,7 +374,7 @@ class GeneratorFullModel(torch.nn.Module):
         if self.loss_weights['perceptual']['l1'] != 0:
             value = 0
             for scale in self.scales:
-                value += (pyramide_generated['prediction_' + str(scale)] - pyramide_real['prediction_' + str(scale)]).abs().mean()
+                value += (pyramide_generated['prediction_' + str(scale)] - pyramide_real['prediction_' + str(scale)].detach()).abs().mean()
             loss_values['perceptual'] += self.loss_weights['perceptual']['l1'] * value
             
 

@@ -18,7 +18,7 @@ class KPDetector(nn.Module):
         self.predictor = AttentionKPHourglass(block_expansion, in_features=image_channel,
                                      max_features=max_features,  reshape_features=reshape_channel, reshape_depth=reshape_depth, num_blocks=num_blocks)
 
-        self.corr_fmap = nn.AvgPool3d(kernel_size=3, stride=(1,2,2), padding=1)
+        # self.corr_fmap = nn.AvgPool3d(kernel_size=3, stride=(1,2,2), padding=1)
         self.kp = nn.Conv3d(in_channels=self.predictor.out_filters, out_channels=num_kp, kernel_size=3, padding=1)
 
         if estimate_jacobian:
@@ -66,7 +66,7 @@ class KPDetector(nn.Module):
         heatmap = heatmap.view(*final_shape)
 
         out = self.gaussian2kp(heatmap)
-        out['feature_map'] = self.corr_fmap(feature_map)
+        # out['feature_map'] = self.corr_fmap(feature_map)
 
         if self.jacobian is not None:
             jacobian_map = self.jacobian(feature_map)

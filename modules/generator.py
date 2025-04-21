@@ -141,11 +141,9 @@ class OcclusionAwareGenerator(nn.Module):
             # Up blocks
             out = self.resblock[2*i](out)
             out = self.resblock[2*i+1](out)
-            # out = self.occlude_input(out, occlusion_map, inverse=False)
-            # encoder_out = self.occlude_input(encoder_map[i], occlusion_map, inverse=True)
-             #TODO: Start training with above commented modifications (occlusion map in upsampling on encoder_map and out)
-            out = self.up_blocks[i](out+encoder_map[i])
-            out = self.occlude_input(out, occlusion_map)
+            encoder_out = self.occlude_input(encoder_map[i], occlusion_map, inverse=True)
+            out = self.up_blocks[i](out+encoder_out)
+            out = self.occlude_input(out, occlusion_map, inverse=False)
             
             # Predict image at scale
             prediction = self.predict_image[i+1](out)

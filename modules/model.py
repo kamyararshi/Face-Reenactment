@@ -2,6 +2,7 @@ from torch import nn
 import torch
 import torch.nn.functional as F
 from modules.util import AntiAliasInterpolation2d, make_coordinate_grid_2d, make_coordinate_grid_3d
+from modules.util_loss import TernaryLoss, SSIM, smooth_grad_1st
 from torchvision import models
 import numpy as np
 from torch.autograd import grad
@@ -293,11 +294,6 @@ def consistency_loss(motion_coarse, motion_fine):
     diff = torch.abs(motion_coarse_upsampled - motion_fine)
     return torch.mean(diff)
 
-def smoothness_loss(motion):
-    diff_d = torch.abs(motion[:, 1:, :, :, :] - motion[:, :-1, :, :, :])
-    diff_w = torch.abs(motion[:, :, :, 1:, :] - motion[:, :, :, :-1, :])
-    diff_h = torch.abs(motion[:, :, 1:, :, :] - motion[:, :, :-1, :, :])
-    return torch.mean(diff_d) + torch.mean(diff_h) + torch.mean(diff_w)
 
 class GeneratorFullModel(torch.nn.Module):
     """
@@ -369,13 +365,22 @@ class GeneratorFullModel(torch.nn.Module):
                     value = torch.abs(x_vgg[i] - y_vgg[i].detach()).mean()
                     value_total += self.loss_weights['perceptual']['vgg'][i] * value
             loss_values['perceptual'] = value_total
-        #TODO: Ternary Loss
-        #NOTE: Right now, L1 loss
+        
+        # Ternary Loss
+        if self.loss_weights['perceptual']['ternary'] != 0:
+            value = 0
+            for scale in self.scales:
+                value += TernaryLoss(
+                    pyramide_real['prediction_' + str(scale)].detach(),
+                    pyramide_generated['prediction_' + str(scale)],
+                ).mean()
+            loss_values['perceptual'] += self.loss_weights['perceptual']['l1'] * value / len(self.scales)
+        
         if self.loss_weights['perceptual']['l1'] != 0:
             value = 0
             for scale in self.scales:
                 value += (pyramide_generated['prediction_' + str(scale)] - pyramide_real['prediction_' + str(scale)].detach()).abs().mean()
-            loss_values['perceptual'] += self.loss_weights['perceptual']['l1'] * value
+            loss_values['perceptual'] += self.loss_weights['perceptual']['l1'] * value / len(self.scales)
             
 
         if self.loss_weights['generator_gan'] != 0:
@@ -405,7 +410,6 @@ class GeneratorFullModel(torch.nn.Module):
                         value_total += self.loss_weights['feature_matching'][i] * value
                     loss_values['feature_matching'] = value_total
 
-        #TODO: Add loss for the motion iterations according to RAFT and Unsupervised OF
         if len(generated['deformation'])>1:
             if self.loss_weights['motion_consistency'] != 0:
                 num = len(generated['deformation'])-1
@@ -415,10 +419,12 @@ class GeneratorFullModel(torch.nn.Module):
                     consistency_loss(f1, f2) for f1,f2 in zip(generated['deformation'][:-1], generated['deformation'][1:])
                     ])/num
             
-            if self.loss_weights['motion_smoothness'] != 0:
-                loss_values['motion_smoothness'] = \
-                    self.loss_weights['motion_smoothness'] * \
-                        sum(smoothness_loss(motion) for motion in generated['deformation'])/(num+1)
+        if self.loss_weights['motion_smoothness'] != 0:
+            #NOTE: reduce image=True reduces source image resolution to 32x32 then calculates the gradient
+            # reduce_image=False reduces the computed gradients (wy, wx) resolution to 31x32 and 32x31
+            loss_values['motion_smoothness'] = \
+                self.loss_weights['motion_smoothness'] * \
+                    smooth_grad_1st(generated['deformation'][-1], x['source'].detach(), reduce_image=False, alpha=10)
 
         #NOTE: for consistent expression-free Rotation-free canonical keypoints
         if self.loss_weights['canonicalkp_consistency'] != 0:
@@ -550,7 +556,9 @@ class DiscriminatorFullModel(torch.nn.Module):
 
     def forward(self, x, generated):
         pyramide_real = self.pyramid(x['driving'])
-        pyramide_generated = ImagePyramide.make_dict([generated['prediction'][-1].detach()], self.scales)
+        pyramide_generated = self.pyramid.make_dict(
+            [img.detach() for img in generated['prediction'][-len(self.scales):]], 
+            self.scales)
 
         discriminator_maps_generated = self.discriminator(pyramide_generated)
         discriminator_maps_real = self.discriminator(pyramide_real)

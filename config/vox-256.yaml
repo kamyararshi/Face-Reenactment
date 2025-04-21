@@ -20,7 +20,7 @@ dataset_params:
 
 model_params:
   common_params:
-    num_kp: 15 
+    num_kp: 25 
     image_channel: 3                    
     feature_channel: 32
     estimate_jacobian: False   # True
@@ -52,16 +52,16 @@ model_params:
       reshape_depth: 16
       compress: 4
   discriminator_params:
-    scales: [1]
+    scales: [1, 0.5]
     block_expansion: 32                 
     max_features: 512
     num_blocks: 4
     sn: True
 
 train_params:
-  num_epochs: 100
-  num_repeats: 1
-  epoch_milestones: [70,90]
+  num_epochs: 300
+  num_repeats: 10
+  epoch_milestones: [90,180]
   lr_generator: 2.0e-4
   lr_discriminator: 2.0e-4
   lr_kp_detector: 2.0e-4
@@ -81,11 +81,12 @@ train_params:
     feature_matching: [10, 10, 10, 10]
     perceptual: 
       vgg: [10, 10, 10, 10, 10]
+      ternary: 10
       l1: 0 #10
     canonicalkp_consistency: 0 #5
     feature_3d_consistency: 0 #5
     motion_consistency: 0 #5
-    motion_smoothness: 0 #5
+    motion_smoothness: 2 #5
     equivariance_value: 10
     equivariance_jacobian: 0    # 10
     keypoint: 10

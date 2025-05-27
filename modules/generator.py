@@ -3,7 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 from modules.util import ResBlock2d, SameBlock2d, UpBlock2d, DownBlock2d, ResBlock3d, SPADEResnetBlock, ContextHourglass, coords_grid
 from modules.dense_motion import DenseMotionInit, DenseMotionNetwork, DenseMotionNetworkUpdater, UpdateBlock3D, Args
-from modules.corr import CorrBlock3D
+# from modules.corr import CorrBlock3D
 from torch.amp import autocast
 
 
@@ -42,7 +42,7 @@ class OcclusionAwareGenerator(nn.Module):
         in_features = in_features[::-1] # Reverse the order for upblocks
         out_features = out_features[::-1] # Reverse the order for upblocks
         for i in range(num_down_blocks):
-            up_blocks.append(UpBlock2d(in_features[i], out_features[i], kernel_size=(3, 3), padding=(1, 1)))
+            up_blocks.append(UpBlock2d(in_features[i]*2, out_features[i], kernel_size=(3, 3), padding=(1, 1)))
         self.up_blocks = nn.ModuleList(up_blocks)
         
         resblock = []
@@ -142,7 +142,7 @@ class OcclusionAwareGenerator(nn.Module):
             out = self.resblock[2*i](out)
             out = self.resblock[2*i+1](out)
             encoder_out = self.occlude_input(encoder_map[i], occlusion_map, inverse=True)
-            out = self.up_blocks[i](out+encoder_out)
+            out = self.up_blocks[i](torch.cat((out,encoder_out), dim=1))
             out = self.occlude_input(out, occlusion_map, inverse=False)
             
             # Predict image at scale

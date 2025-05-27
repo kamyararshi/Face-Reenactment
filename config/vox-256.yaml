@@ -20,7 +20,7 @@ dataset_params:
 
 model_params:
   common_params:
-    num_kp: 25 
+    num_kp: 20 
     image_channel: 3                    
     feature_channel: 32
     estimate_jacobian: False   # True
@@ -52,15 +52,19 @@ model_params:
       reshape_depth: 16
       compress: 4
   discriminator_params:
-    scales: [1, 0.5]
+    scales: [1]
     block_expansion: 32                 
     max_features: 512
     num_blocks: 4
     sn: True
+  refiner_params:
+    block_expansion: 256
+    num_blocks: 3
+    max_features: 512
 
 train_params:
   num_epochs: 300
-  num_repeats: 10
+  num_repeats: 1
   epoch_milestones: [90,180]
   lr_generator: 2.0e-4
   lr_discriminator: 2.0e-4
@@ -92,6 +96,31 @@ train_params:
     keypoint: 10
     headpose: 20
     expression: 10    #TODO: For experiments (facial expression improvement)
+  
+  refinement_stage:
+    num_epochs: 100
+    num_repeats: 1
+    epoch_milestones: [50,80]
+    lr_refiner: 1.0e-4
+    gan_mode: 'hinge'    # hinge or ls
+    batch_size: 16
+    scales: [1, 0.5, 0.25, 0.125]
+    checkpoint_freq: 10
+    gaze_loss:
+      path: 'gaze_models/gazeestimation_gazetr.pt'
+      criterion: 'cosine'
+      weight: 40
+    wing_loss:
+      weight: 40
+    id_loss:
+      weight: 40
+    pixel_loss:
+      weight: 40
+    ternary:
+      weight: 10
+    l1:
+      weight: 0
+
 
 visualizer_params:
   kp_size: 5

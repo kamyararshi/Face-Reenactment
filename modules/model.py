@@ -2,13 +2,14 @@ from torch import nn
 import torch
 import torch.nn.functional as F
 from modules.util import AntiAliasInterpolation2d, make_coordinate_grid_2d, make_coordinate_grid_3d
-from modules.util_loss import TernaryLoss, SSIM, smooth_grad_1st
+from modules.util_loss import FaceParser, TernaryLoss, SSIM, smooth_grad_1st
 from torchvision import models
 import numpy as np
 from torch.autograd import grad
 import modules.hopenet as hopenet
+from modules.gaze import Model
+from torchvision.models.detection import retinanet_resnet50_fpn
 from torchvision import transforms
-from torch.amp import autocast
 
 
 class Vgg19(torch.nn.Module):
@@ -133,84 +134,84 @@ class Transform:
         jacobian = torch.cat([grad_x[0].unsqueeze(-2), grad_y[0].unsqueeze(-2)], dim=-2)
         return jacobian
 
-class Transform3D:
-    """
-    Random 3D transformations for equivariance constraints, including frame transformation.
-    """
-    def __init__(self, bs, device, **kwargs):
-        self.device = device
-        # Affine transformation for 3D
-        noise = torch.normal(mean=0, std=kwargs['sigma_affine'] * torch.ones([bs, 3, 4]))
-        self.theta = (noise + torch.eye(3, 4).view(1, 3, 4)).to(self.device)
-        self.bs = bs
+# class Transform3D:
+#     """
+#     Random 3D transformations for equivariance constraints, including frame transformation.
+#     """
+#     def __init__(self, bs, device, **kwargs):
+#         self.device = device
+#         # Affine transformation for 3D
+#         noise = torch.normal(mean=0, std=kwargs['sigma_affine'] * torch.ones([bs, 3, 4]))
+#         self.theta = (noise + torch.eye(3, 4).view(1, 3, 4)).to(self.device)
+#         self.bs = bs
 
-        # Thin Plate Spline (TPS) configuration
-        if ('sigma_tps' in kwargs) and ('points_tps' in kwargs):
-            self.tps = True
-            self.control_points = make_coordinate_grid_3d(
-                (kwargs['points_tps'], kwargs['points_tps'], kwargs['points_tps']),
-                type=noise.type(), device=self.device)
-            self.control_points = self.control_points.unsqueeze(0)
-            self.control_params = torch.normal(
-                mean=0, std=kwargs['sigma_tps'] * torch.ones([bs, 1, kwargs['points_tps'] ** 3]))
-            self.control_params = self.control_params.to(self.device)
-        else:
-            self.tps = False
+#         # Thin Plate Spline (TPS) configuration
+#         if ('sigma_tps' in kwargs) and ('points_tps' in kwargs):
+#             self.tps = True
+#             self.control_points = make_coordinate_grid_3d(
+#                 (kwargs['points_tps'], kwargs['points_tps'], kwargs['points_tps']),
+#                 type=noise.type(), device=self.device)
+#             self.control_points = self.control_points.unsqueeze(0)
+#             self.control_params = torch.normal(
+#                 mean=0, std=kwargs['sigma_tps'] * torch.ones([bs, 1, kwargs['points_tps'] ** 3]))
+#             self.control_params = self.control_params.to(self.device)
+#         else:
+#             self.tps = False
 
-    def transform_frame_3d(self, frame):
-        """
-        Apply a homography derived from the 3D transformation to the 2D frame.
-        """
-        # Derive homography from the 3D affine matrix
-        H = self.theta[:, :2, :3]  # Extract the 2D projection of the 3D matrix
-        grid = make_coordinate_grid_2d(frame.shape[2:], type=frame.type(), device=frame.device).unsqueeze(0)
-        grid = grid.view(1, frame.shape[2] * frame.shape[3], 2)
+#     def transform_frame_3d(self, frame):
+#         """
+#         Apply a homography derived from the 3D transformation to the 2D frame.
+#         """
+#         # Derive homography from the 3D affine matrix
+#         H = self.theta[:, :2, :3]  # Extract the 2D projection of the 3D matrix
+#         grid = make_coordinate_grid_2d(frame.shape[2:], type=frame.type(), device=frame.device).unsqueeze(0)
+#         grid = grid.view(1, frame.shape[2] * frame.shape[3], 2)
         
-        # Apply homography to the grid
-        H = H.unsqueeze(1)  # Shape: [bs, 1, 2, 3]
-        transformed_grid = torch.matmul(H[:, :, :, :2], grid.unsqueeze(-1)) + H[:, :, :, 2:]
-        transformed_grid = transformed_grid.squeeze(-1).view(self.bs, frame.shape[2], frame.shape[3], 2)
+#         # Apply homography to the grid
+#         H = H.unsqueeze(1)  # Shape: [bs, 1, 2, 3]
+#         transformed_grid = torch.matmul(H[:, :, :, :2], grid.unsqueeze(-1)) + H[:, :, :, 2:]
+#         transformed_grid = transformed_grid.squeeze(-1).view(self.bs, frame.shape[2], frame.shape[3], 2)
         
-        return F.grid_sample(frame, transformed_grid, padding_mode="zeros", align_corners=False)
+#         return F.grid_sample(frame, transformed_grid, padding_mode="zeros", align_corners=False)
 
 
-    def warp_coordinates_2d(self, coordinates):
-        """
-        Warp 2D coordinates for frame transformation.
-        """
-        theta_2d = self.theta[:, :2, :3].type(coordinates.type())  # Use 2D slice of the 3D affine transformation
-        theta_2d = theta_2d.unsqueeze(1)  # Shape: [bs, 1, 2, 3]
+#     def warp_coordinates_2d(self, coordinates):
+#         """
+#         Warp 2D coordinates for frame transformation.
+#         """
+#         theta_2d = self.theta[:, :2, :3].type(coordinates.type())  # Use 2D slice of the 3D affine transformation
+#         theta_2d = theta_2d.unsqueeze(1)  # Shape: [bs, 1, 2, 3]
 
-        # Apply affine transformation
-        transformed = torch.matmul(theta_2d[:, :, :, :2], coordinates.unsqueeze(-1)) + theta_2d[:, :, :, 2:]
-        transformed = transformed.squeeze(-1)
-        return transformed
+#         # Apply affine transformation
+#         transformed = torch.matmul(theta_2d[:, :, :, :2], coordinates.unsqueeze(-1)) + theta_2d[:, :, :, 2:]
+#         transformed = transformed.squeeze(-1)
+#         return transformed
 
-    def warp_coordinates(self, coordinates):
-        """
-        Warp 3D coordinates using affine and TPS transformations if enabled.
-        """
-        theta = self.theta.type(coordinates.type())
-        theta = theta.unsqueeze(1)  # Shape: [bs, 1, 3, 4]
+#     def warp_coordinates(self, coordinates):
+#         """
+#         Warp 3D coordinates using affine and TPS transformations if enabled.
+#         """
+#         theta = self.theta.type(coordinates.type())
+#         theta = theta.unsqueeze(1)  # Shape: [bs, 1, 3, 4]
 
-        # Apply affine transformation
-        transformed = torch.matmul(theta[:, :, :, :3], coordinates.unsqueeze(-1)) + theta[:, :, :, 3:]
-        transformed = transformed.squeeze(-1)
+#         # Apply affine transformation
+#         transformed = torch.matmul(theta[:, :, :, :3], coordinates.unsqueeze(-1)) + theta[:, :, :, 3:]
+#         transformed = transformed.squeeze(-1)
 
-        if self.tps:
-            control_points = self.control_points.type(coordinates.type())
-            control_params = self.control_params.type(coordinates.type())
-            distances = coordinates.view(coordinates.shape[0], -1, 1, 3) - control_points.view(1, 1, -1, 3)
-            distances = torch.norm(distances, dim=-1)
+#         if self.tps:
+#             control_points = self.control_points.type(coordinates.type())
+#             control_params = self.control_params.type(coordinates.type())
+#             distances = coordinates.view(coordinates.shape[0], -1, 1, 3) - control_points.view(1, 1, -1, 3)
+#             distances = torch.norm(distances, dim=-1)
 
-            #NOTE: We have tried 2D RBF kernel with this as well (vox-256_01_12_24_13.37.52_device_1)
-            #NOTE: We have tried 3D RBF Kernel RBF(r)=r (result=distance) and it does not work at all! (vox-256_02_12_24_15.08.58_device_0)
-            result = distances ** 2
-            result = distances * control_params
-            result = result.sum(dim=2).view(self.bs, coordinates.shape[1], 1)
-            transformed = transformed + result
+#             #NOTE: We have tried 2D RBF kernel with this as well (vox-256_01_12_24_13.37.52_device_1)
+#             #NOTE: We have tried 3D RBF Kernel RBF(r)=r (result=distance) and it does not work at all! (vox-256_02_12_24_15.08.58_device_0)
+#             result = distances ** 2
+#             result = distances * control_params
+#             result = result.sum(dim=2).view(self.bs, coordinates.shape[1], 1)
+#             transformed = transformed + result
 
-        return transformed
+#         return transformed
     
 
 def detach_kp(kp):
@@ -300,15 +301,17 @@ class GeneratorFullModel(torch.nn.Module):
     Merge all generator related updates into single model for better multi-gpu usage
     """
 
-    def __init__(self, kp_extractor, he_estimator, generator, discriminator, train_params, estimate_jacobian=True, device=None):
+    def __init__(self, kp_detector, he_estimator, generator, discriminator, train_params, train_stage, estimate_jacobian=True, device=None):
         super(GeneratorFullModel, self).__init__()
-        self.kp_extractor = kp_extractor
+        self.kp_extractor = kp_detector
         self.he_estimator = he_estimator
         self.generator = generator
-        self.discriminator = discriminator
         self.train_params = train_params
+        self.stage = train_stage
         self.scales = train_params['scales']
-        self.disc_scales = self.discriminator.scales
+        if discriminator is not None:
+            self.discriminator = discriminator
+            self.disc_scales = self.discriminator.scales
         self.pyramid = ImagePyramide(self.scales, generator.image_channel)
         self.transform_hopenet =  transforms.Compose([transforms.Resize(size=(224, 224)),
                                                      transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
@@ -323,6 +326,7 @@ class GeneratorFullModel(torch.nn.Module):
             self.vgg = Vgg19()
             if torch.cuda.is_available() and device!=None:
                 self.vgg = self.vgg.to(device)
+                self.vgg.eval()
 
         if self.loss_weights['headpose'] != 0:
             self.hopenet = hopenet.Hopenet(models.resnet.Bottleneck, [3, 4, 6, 3], 66)
@@ -332,10 +336,41 @@ class GeneratorFullModel(torch.nn.Module):
             if torch.cuda.is_available() and device!=None:
                 self.hopenet = self.hopenet.to(device)
                 self.hopenet.eval()
+        
+        if self.stage=='refiner': #TODO: Merge both training stages in this module
+            for param in self.generator.parameters():
+                param.requires_grad = False  # Freeze all generator parameters initially
+
+            # Enable learning only for specific generator submodules
+            trainable_submodules = []
+            for predictors in self.generator.predict_image:
+                for param in predictors.parameters():
+                    param.requires_grad = True
+                predictors.train()
+                trainable_submodules.append(predictors)
+            for resblock in self.generator.resblocks:
+                for param in resblock.parameters():
+                    param.requires_grad = True
+                resblock.train()
+                trainable_submodules.append(resblock)
+            for up_blocks in self.generator.up_blocks:
+                for param in up_blocks.parameters():
+                    param.requires_grad = True
+                up_blocks.train()
+                trainable_submodules.append(up_blocks)
+
+            # Set evaluation mode for non-trainable modules
+            self.kp_extractor.eval()
+            self.he_estimator.eval()
+
+            # Ensure generator's other submodules are in eval mode
+            for name, module in self.generator.named_children():
+                if module not in trainable_submodules:
+                    module.eval()
 
 
-    def forward(self, x, add_expression=True, rec_driving=False):
-        kp_canonical = self.kp_extractor(x['source'])     # {'value': value, 'jacobian': jacobian}   
+    def forward(self, x, add_expression=True, rec_driving=False, compute_loss=True):
+        kp_canonical = self.kp_extractor(x['source'])     # {'value': value, 'jacobian': jacobian, 'heatmap': heatmap}   
         kp_canonical_d = self.kp_extractor(x['driving'])
 
         he_source = self.he_estimator(x['source'])        # {'yaw': yaw, 'pitch': pitch, 'roll': roll, 't': t, 'exp': exp}
@@ -347,8 +382,35 @@ class GeneratorFullModel(torch.nn.Module):
 
         generated = self.generator(x['source'], x['driving'], kp_source=kp_source,
                                    kp_driving=kp_driving, rec_driving=rec_driving)
-        generated.update({'kp_source': kp_source, 'kp_driving': kp_driving})
+        generated.update({'kp_source': kp_source, 'kp_driving': kp_driving, 'heatmap_driving': kp_canonical_d['heatmap']})
 
+        if compute_loss:
+            loss_values = self._compute_loss(
+                x=x,
+                generated=generated,
+                kp_canonical=kp_canonical,
+                kp_driving=kp_driving,
+                kp_canonical_d=kp_canonical_d,
+                he_driving=he_driving,
+                add_expression=add_expression
+            )
+        else:
+            loss_values = {}
+
+        return loss_values, generated
+    
+    
+    def _compute_loss(self, 
+                      x: dict, 
+                      generated: dict, 
+                      kp_canonical: dict, 
+                      kp_driving: dict, 
+                      kp_canonical_d: dict, 
+                      he_driving: dict,
+                      add_expression: bool) -> dict:
+        """
+        Helper function thath Computes the loss functions during training
+        """
         loss_values = {}
 
         pyramide_real = self.pyramid(x['driving'])
@@ -525,8 +587,122 @@ class GeneratorFullModel(torch.nn.Module):
             value = torch.norm(he_driving['exp'], p=1, dim=-1).mean()
             loss_values['expression'] = self.loss_weights['expression'] * value
 
-        return loss_values, generated
+        return loss_values
 
+class ExpressionRefinerFullModel(torch.nn.Module):
+    def __init__(self, kp_extractor,
+                 he_estimator,
+                 generator,
+                 expr_refiner,
+                 train_params,
+                 device=None,
+                 estimate_jacobian=False,):
+        super().__init__()
+        self.train_params = train_params
+        self.kp_extractor = kp_extractor.eval()
+        self.he_estimator = he_estimator.eval()
+        self.generator = generator.eval()
+        self.expr_refiner = expr_refiner
+        self.estimate_jacobian = estimate_jacobian
+        
+        # Loss functions
+        weights = self.train_params['gaze_loss']['path'] #"gaze_models/gazeestimation_gazetr.pt"
+        self.gaze = Model(criterion=self.train_params['gaze_loss']['criterion']).to(device)
+        self.gaze.load_state_dict(torch.load(weights))
+        self.gaze.eval()
+
+        # ID Loss #TODO: Change the face detector to VGGFace or ArcFace (ArcFace had the embedding problem)
+        self.face_detector = retinanet_resnet50_fpn(pretrained=True).to(device).eval()
+
+        # Face parser
+        self.face_parser = FaceParser(device=device) #NOTE: Check other args
+
+
+    @torch.no_grad()
+    def get_embeddings(self, image):
+        features = self.face_detector.backbone.body(image)['2']
+        embeddings = F.avg_pool2d(features, kernel_size=features.size()[2:]).view(image.size(0), -1)
+        return embeddings
+
+    def loss_id(self, i,j, device):
+        return F.cosine_embedding_loss(i,j, torch.ones(i.shape[0]).to(device))
+
+    def forward(self, x, add_expression=True, rec_driving=False, compute_loss=True):
+        with torch.no_grad():
+            # Step1: Reenactment
+            kp_canonical = self.kp_extractor(x['source'])     # {'value': value, 'jacobian': jacobian, 'heatmap': heatmap}   
+            kp_canonical_d = self.kp_extractor(x['driving'])
+
+            he_source = self.he_estimator(x['source'])        # {'yaw': yaw, 'pitch': pitch, 'roll': roll, 't': t, 'exp': exp}
+            he_driving = self.he_estimator(x['driving'])      # {'yaw': yaw, 'pitch': pitch, 'roll': roll, 't': t, 'exp': exp}
+
+            kp_source = keypoint_transformation(kp_canonical, he_source, self.estimate_jacobian, add_expression=add_expression)
+            kp_driving = keypoint_transformation(kp_canonical, he_driving, self.estimate_jacobian, add_expression=add_expression)
+
+            generated = self.generator(x['source'], x['driving'], kp_source=kp_source,
+                                    kp_driving=kp_driving, rec_driving=rec_driving)
+            generated.update({'kp_source': kp_source, 'kp_driving': kp_driving, 'heatmap_driving': kp_canonical_d['heatmap']})
+
+        # Step2: Refinement
+        out = self.expr_refiner(generated['prediction'][-1], generated['heatmap_driving'])
+        generated.update({'prediction_refined': out})
+
+        if not compute_loss:
+            loss_values = {}
+            return loss_values, generated
+        else:
+            loss_values = self._compute_loss(x, generated)
+            return loss_values, generated
+
+    def _compute_loss(self, x, generated):
+        loss_values = {}
+        if self.train_params['gaze_loss']['weight'] != 0:
+            # Gaze Loss
+            gaze_loss = 1 - self.gaze.loss(generated['prediction_refined'], x['driving'].detach())
+            loss_values['gaze_loss'] = self.train_params['gaze_loss']['weight'] * gaze_loss
+
+        if self.train_params['wing_loss']['weight'] != 0:
+            # Wing Loss
+            kp_refined_canonical = self.kp_extractor(generated['prediction_refined'])
+            he_refined = self.he_estimator(generated['prediction_refined'])
+            kp_refined = keypoint_transformation(kp_refined_canonical, he_refined, estimate_jacobian=False)
+            
+            wing_loss = F.smooth_l1_loss(kp_refined['value'], generated['kp_driving']['value'].detach())
+            loss_values['wing_loss'] = self.train_params['wing_loss']['weight'] * wing_loss
+        
+        if self.train_params['id_loss']['weight'] != 0:
+            # ID Loss
+            embed_gen = self.get_embeddings(generated['prediction_refined'])
+            embed_src = self.get_embeddings(x['source'])
+            loss_values['id_loss'] = self.train_params['id_loss']['weight'] *\
+                self.loss_id(embed_gen, embed_src, device=generated['prediction_refined'].device)
+
+        if self.train_params['pixel_loss']['weight'] != 0:
+            # Masks only from driving (they should match the reenacted)
+            masks = self.face_parser(x['driving'], keep=['eyes', 'lips', 'mouth'])
+            refined_masked = generated['prediction_refined'] * masks
+            driving_masked = x['driving'] * masks
+            pixel_loss = F.smooth_l1_loss(refined_masked, driving_masked, reduction='sum') / (
+                masks.sum() + 1e-8
+            )
+            loss_values['pixel_loss'] = self.train_params['pixel_loss']['weight'] * pixel_loss
+
+        # Ternary Loss
+        if self.train_params['ternary']['weight'] != 0:
+            value = 0
+            
+            value += TernaryLoss(
+                x['driving'].detach(),
+                generated['prediction_refined'],
+            ).mean()
+            loss_values['ternary'] = self.train_params['ternary']['weight'] * value
+        
+        if self.train_params['l1']['weight'] != 0:
+            value = 0
+            value += (generated['prediction_refined'] - x['driving'].detach()).abs().mean()
+            loss_values['l_one'] = self.train_params['l1']['weight'] * value
+
+        return loss_values
 
 class DiscriminatorFullModel(torch.nn.Module):
     """

@@ -13,6 +13,7 @@ from frames_dataset import FramesDataset, ImagesDataset
 from modules.generator import OcclusionAwareGenerator, OcclusionAwareSPADEGenerator
 from modules.discriminator import MultiScaleDiscriminator
 from modules.keypoint_detector import KPDetector, HEEstimator
+from modules.expression_refiner import ExpressionRefiner
 
 import torch
 
@@ -26,10 +27,11 @@ if __name__ == "__main__":
 
     parser = ArgumentParser()
     parser.add_argument("--config", default="config/vox-256.yaml", help="path to config")
-    parser.add_argument("--mode", default="train", choices=["train", "generate"])
+    parser.add_argument("--stage", default="base", choices=["base", "refiner"])
     parser.add_argument("--gen", default="original", choices=["original", "spade"])
     parser.add_argument("--log_dir", default='log', help="path to log into")
     parser.add_argument("--checkpoint", default=None, help="path to checkpoint to restore")
+    parser.add_argument("--refiner_checkpoint", default=None, help="path to refiner checkpoint to restore")
     parser.add_argument("--device_ids", default="0", type=lambda x: list(map(int, x.split(','))),
                         help="Names of the devices comma separated.")
     parser.add_argument("--no_expr", dest="add_expr", action="store_false", help="Include expression deformation in keypoints")
@@ -59,6 +61,12 @@ if __name__ == "__main__":
 
     if opt.checkpoint is not None:
         log_dir = os.path.join(*os.path.split(opt.checkpoint)[:-1])
+        if opt.stage == 'refiner' and opt.refiner_checkpoint is not None:
+            refiner_folder = os.path.split(os.path.dirname(opt.checkpoint))
+            log_dir = os.path.join(*os.path.split(opt.checkpoint)[:-1], refiner_folder)
+        elif opt.stage == 'refiner' and opt.refiner_checkpoint is None:
+            log_dir = os.path.join(*os.path.split(opt.checkpoint)[:-1])
+            log_dir += '/refiner_' + strftime("%d_%m_%y_%H.%M.%S", gmtime()) + '_device_' + str(device_id)
     else:
         log_dir = os.path.join(opt.log_dir, os.path.basename(opt.config).split('.')[0])
         log_dir += '_' + strftime("%d_%m_%y_%H.%M.%S", gmtime()) + '_device_' + str(device_id)
@@ -99,8 +107,11 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         he_estimator.to(device_id)
 
-    if opt.mode == 'train':
+    if opt.stage == 'base':
         # dataset = FramesDataset(is_train=(opt.mode == 'train'), **config['dataset_params'])
+        dataset = ImagesDataset(is_train=True, **config['dataset_params'])
+        val_dataset = ImagesDataset(is_train=False, **config['dataset_params'])
+    elif opt.stage == 'refiner':
         dataset = ImagesDataset(is_train=True, **config['dataset_params'])
         val_dataset = ImagesDataset(is_train=False, **config['dataset_params'])
 
@@ -109,7 +120,7 @@ if __name__ == "__main__":
     if not os.path.exists(os.path.join(log_dir, os.path.basename(opt.config))):
         copy(opt.config, log_dir)
 
-    if opt.mode == 'train':
+    if opt.stage == 'base':
         if len(opt.device_ids)>1 and torch.cuda.device_count()>1:
             from train_ddp import train
             import torch.multiprocessing as mp
@@ -121,3 +132,22 @@ if __name__ == "__main__":
             from train import train
             print("Training with Single GPU...")
             train(config, generator, discriminator, kp_detector, he_estimator, opt, log_dir, dataset, val_dataset, device_id)
+    
+    elif opt.stage == 'refiner':
+        refiner = ExpressionRefiner(**config['model_params']['refiner_params'],
+                                    **config['model_params']['common_params'])
+        if torch.cuda.is_available():
+            refiner.to(device_id)
+        if opt.verbose:
+            print(refiner)
+
+        if len(opt.device_ids)>1 and torch.cuda.device_count()>1:
+            from train_ddp import train_refiner
+            import torch.multiprocessing as mp
+            print("Training with DDP...")
+            world_size = len(opt.device_ids)
+            mp.spawn(train_refiner,
+                     args=(world_size, config, generator, refiner, kp_detector, he_estimator, opt, log_dir, dataset, val_dataset),
+                     nprocs=world_size, join=True)
+        else:
+            raise ValueError("Refiner training is not supported in single GPU mode yet.")

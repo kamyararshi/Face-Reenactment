@@ -403,6 +403,69 @@ class Hourglass(nn.Module):
         return self.decoder(self.encoder(x))
 
 
+class Encoder2D(nn.Module):
+    """
+    Hourglass Encoder for 2D data
+    """
+    def __init__(self, block_expansion, in_features, num_blocks=3, max_features=256):
+        super(Encoder2D, self).__init__()
+        down_blocks = []
+        for i in range(num_blocks):
+            down_blocks.append(DownBlock2d(
+                in_features if i == 0 else min(max_features, block_expansion * (2 ** i)),
+                min(max_features, block_expansion * (2 ** (i + 1))),
+                kernel_size=3, padding=1
+            ))
+        self.down_blocks = nn.ModuleList(down_blocks)
+
+    def forward(self, x):
+        outs = [x]
+        for down_block in self.down_blocks:
+            outs.append(down_block(outs[-1]))
+        return outs
+
+class Decoder2D(nn.Module):
+    """
+    Hourglass Decoder for 2D data
+    """
+    def __init__(self, block_expansion, in_features, num_blocks=3, max_features=256):
+        super(Decoder2D, self).__init__()
+        up_blocks = []
+        for i in range(num_blocks)[::-1]:
+            in_filters = (1 if i == num_blocks - 1 else 2) * min(max_features, block_expansion * (2 ** (i + 1)))
+            out_filters = min(max_features, block_expansion * (2 ** i))
+            up_blocks.append(UpBlock2d(in_filters, out_filters, kernel_size=3, padding=1))
+        self.up_blocks = nn.ModuleList(up_blocks)
+        self.out_filters = block_expansion + in_features
+        self.conv = nn.Conv2d(in_channels=self.out_filters, out_channels=self.out_filters, kernel_size=3, padding=1)
+        self.norm = BatchNorm2d(self.out_filters, affine=True)
+
+    def forward(self, x):
+        out = x.pop()
+        for up_block in self.up_blocks:
+            out = up_block(out)
+            skip = x.pop()
+            out = torch.cat([out, skip], dim=1)
+        out = self.conv(out)
+        out = self.norm(out)
+        out = F.relu(out)
+        return out
+
+# HourGlass2D Module
+class HourGlass2D(nn.Module):
+    """
+    Hourglass architecture for 2D data
+    """
+    def __init__(self, block_expansion, in_features, num_blocks=3, max_features=256):
+        super(HourGlass2D, self).__init__()
+        self.encoder = Encoder2D(block_expansion, in_features, num_blocks, max_features)
+        self.decoder = Decoder2D(block_expansion, in_features, num_blocks, max_features)
+        self.out_filters = self.decoder.out_filters
+
+    def forward(self, x):
+        return self.decoder(self.encoder(x))
+
+
 class AttentionKPHourglass(nn.Module):
     """
     Hourglass architecture.

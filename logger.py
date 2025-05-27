@@ -112,7 +112,7 @@ class Logger:
         """
         source = inputs['source']
         driving = inputs['driving']
-        prediction = output['prediction'][-1]
+        prediction = output
 
         batch_size = source.shape[0]
         fig, axs = plt.subplots(batch_size, 3, figsize=(15, 5 * batch_size), squeeze=False)
@@ -140,7 +140,7 @@ class Logger:
             x = {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in x.items()}
             corss_input[name] = x[name]
             
-        _, out = generator_full(corss_input, rec_driving=False, add_expression=True)
+        _, out = generator_full(corss_input, rec_driving=False, add_expression=True, compute_loss=False)
         
         return corss_input, out
     
@@ -161,6 +161,7 @@ class Logger:
     @staticmethod
     def load_cpk(checkpoint_path, generator=None, discriminator=None, kp_detector=None, he_estimator=None,
                 optimizer_generator=None, optimizer_discriminator=None, optimizer_kp_detector=None, optimizer_he_estimator=None,
+                refiner_checkpoint_path=None, refiner=None, optimizer_refiner=None,
                 rank=None):
         """
         Loads a checkpoint and maps it to the correct device for DDP.
@@ -214,6 +215,16 @@ class Logger:
         if optimizer_he_estimator is not None:
             optimizer_he_estimator.load_state_dict(checkpoint['optimizer_he_estimator'])
             Logger.move_optimizer_states(optimizer_he_estimator, map_location)
+
+        # Stage 2 -- Expression refiner
+        if (refiner is not None) and (refiner_checkpoint_path is not None):
+            checkpoint = torch.load(refiner_checkpoint_path, map_location=map_location)
+            refiner.load_state_dict(checkpoint['refiner'])
+
+            if optimizer_refiner is not None:
+                optimizer_refiner.load_state_dict(checkpoint['optimizer_refiner'])
+                Logger.move_optimizer_states(optimizer_refiner, map_location)
+
 
         # Return epoch and global epoch for resuming training
         return checkpoint['epoch'], checkpoint['global_epoch']
@@ -317,6 +328,11 @@ class Visualizer:
         # Driving image reconstructed using it's feat_3d
         if out['driving_rec'] is not None:
             driving_rec = out['driving_rec'].data.cpu().numpy()
+            driving_rec = np.transpose(driving_rec, [0, 2, 3, 1])
+            images.append(driving_rec)
+
+        if 'prediction_refined' in out:
+            driving_rec = out['prediction_refined'].data.cpu().numpy()
             driving_rec = np.transpose(driving_rec, [0, 2, 3, 1])
             images.append(driving_rec)
 

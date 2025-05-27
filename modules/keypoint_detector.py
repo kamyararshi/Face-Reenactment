@@ -66,7 +66,8 @@ class KPDetector(nn.Module):
         heatmap = heatmap.view(*final_shape)
 
         out = self.gaussian2kp(heatmap)
-        # out['feature_map'] = self.corr_fmap(feature_map)
+        # NOTE: For stage 2 (expr. refinement)
+        out['heatmap'] = heatmap
 
         if self.jacobian is not None:
             jacobian_map = self.jacobian(feature_map)

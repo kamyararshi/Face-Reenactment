@@ -313,8 +313,7 @@ class GeneratorFullModel(torch.nn.Module):
             self.discriminator = discriminator
             self.disc_scales = self.discriminator.scales
         self.pyramid = ImagePyramide(self.scales, generator.image_channel)
-        self.transform_hopenet =  transforms.Compose([transforms.Resize(size=(224, 224)),
-                                                     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+        
         if torch.cuda.is_available():
             self.pyramid = self.pyramid.cuda()
 
@@ -327,48 +326,86 @@ class GeneratorFullModel(torch.nn.Module):
             if torch.cuda.is_available() and device!=None:
                 self.vgg = self.vgg.to(device)
                 self.vgg.eval()
+                
+        if self.stage == 'base':
+            self.transform_hopenet =  transforms.Compose([transforms.Resize(size=(224, 224)),
+                                                        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
 
-        if self.loss_weights['headpose'] != 0:
-            self.hopenet = hopenet.Hopenet(models.resnet.Bottleneck, [3, 4, 6, 3], 66)
-            print('Loading hopenet')
-            hopenet_state_dict = torch.load(train_params['hopenet_snapshot'])
-            self.hopenet.load_state_dict(hopenet_state_dict)
-            if torch.cuda.is_available() and device!=None:
-                self.hopenet = self.hopenet.to(device)
-                self.hopenet.eval()
+            if self.loss_weights['headpose'] != 0:
+                self.hopenet = hopenet.Hopenet(models.resnet.Bottleneck, [3, 4, 6, 3], 66)
+                print('Loading hopenet')
+                hopenet_state_dict = torch.load(train_params['hopenet_snapshot'])
+                self.hopenet.load_state_dict(hopenet_state_dict)
+                if torch.cuda.is_available() and device!=None:
+                    self.hopenet = self.hopenet.to(device)
+                    self.hopenet.eval()
         
-        if self.stage=='refiner': #TODO: Merge both training stages in this module
-            for param in self.generator.parameters():
-                param.requires_grad = False  # Freeze all generator parameters initially
+        elif self.stage=='refiner':
+            self._set_train()
+            # Loss functions
+            weights = self.train_params['gaze_loss']['path'] #"gaze_models/gazeestimation_gazetr.pt"
+            if self.train_params['loss_weights']['gaze_loss'] != 0:
+                self.gaze = Model(criterion=self.train_params['gaze_loss']['criterion']).to(device)
+                self.gaze.load_state_dict(torch.load(weights))
+                self.gaze.eval()
 
-            # Enable learning only for specific generator submodules
-            trainable_submodules = []
-            for predictors in self.generator.predict_image:
-                for param in predictors.parameters():
-                    param.requires_grad = True
-                predictors.train()
-                trainable_submodules.append(predictors)
-            for resblock in self.generator.resblocks:
-                for param in resblock.parameters():
-                    param.requires_grad = True
-                resblock.train()
-                trainable_submodules.append(resblock)
-            for up_blocks in self.generator.up_blocks:
-                for param in up_blocks.parameters():
-                    param.requires_grad = True
-                up_blocks.train()
-                trainable_submodules.append(up_blocks)
+            # ID Loss #TODO: Change the face detector to VGGFace or ArcFace (ArcFace had the embedding problem)
+            if self.train_params['loss_weights']['id_loss'] != 0:
+                # self.face_detector = models.vgg16(pretrained=True).features.to(device).eval()
+                # self.face_detector = nn.Sequential(*list(self.face_detector.children())[:30])
+                self.face_detector = retinanet_resnet50_fpn(pretrained=True).to(device).eval()
 
-            # Set evaluation mode for non-trainable modules
-            self.kp_extractor.eval()
-            self.he_estimator.eval()
+            # Face parser
+            self.face_parser = FaceParser(device=device) #NOTE: Check other args
 
-            # Ensure generator's other submodules are in eval mode
-            for name, module in self.generator.named_children():
-                if module not in trainable_submodules:
-                    module.eval()
+    def _set_train(self):
+        """
+        Deactivates training for all modules except the generator decoders, up_blocks, and predictors
+        """
+        for param in self.generator.parameters():
+            param.requires_grad = False  # Freeze all generator parameters initially
 
+        # Enable learning only for specific generator submodules
+        trainable_submodules = []
+        for predictors in self.generator.predict_image:
+            for param in predictors.parameters():
+                param.requires_grad = True
+            predictors.train()
+            trainable_submodules.append(predictors)
+        for resblock in self.generator.resblock:
+            for param in resblock.parameters():
+                param.requires_grad = True
+            resblock.train()
+            trainable_submodules.append(resblock)
+        for up_blocks in self.generator.up_blocks:
+            for param in up_blocks.parameters():
+                param.requires_grad = True
+            up_blocks.train()
+            trainable_submodules.append(up_blocks)
 
+        # Set evaluation mode for non-trainable modules
+        for params in self.kp_extractor.parameters():
+            params.requires_grad = False
+        for params in self.he_estimator.parameters():
+            params.requires_grad = False
+
+        self.kp_extractor.eval()
+        self.he_estimator.eval()
+
+        # Ensure generator's other submodules are in eval mode
+        for name, module in self.generator.named_children():
+            if module not in trainable_submodules:
+                module.eval()
+
+    @torch.no_grad()
+    def get_embeddings(self, image):
+        features = self.face_detector.backbone.body(image)['2']
+        embeddings = F.avg_pool2d(features, kernel_size=features.size()[2:]).view(image.size(0), -1)
+        return embeddings
+
+    def loss_id(self, i,j, device):
+        return F.cosine_embedding_loss(i,j, torch.ones(i.shape[0]).to(device))
+    
     def forward(self, x, add_expression=True, rec_driving=False, compute_loss=True):
         kp_canonical = self.kp_extractor(x['source'])     # {'value': value, 'jacobian': jacobian, 'heatmap': heatmap}   
         kp_canonical_d = self.kp_extractor(x['driving'])
@@ -384,7 +421,7 @@ class GeneratorFullModel(torch.nn.Module):
                                    kp_driving=kp_driving, rec_driving=rec_driving)
         generated.update({'kp_source': kp_source, 'kp_driving': kp_driving, 'heatmap_driving': kp_canonical_d['heatmap']})
 
-        if compute_loss:
+        if compute_loss and self.stage=='base':
             loss_values = self._compute_loss(
                 x=x,
                 generated=generated,
@@ -393,6 +430,11 @@ class GeneratorFullModel(torch.nn.Module):
                 kp_canonical_d=kp_canonical_d,
                 he_driving=he_driving,
                 add_expression=add_expression
+            )
+        elif compute_loss and self.stage=='refiner':
+            loss_values = self._compute_loss_stage2(
+                x=x,
+                generated=generated,
             )
         else:
             loss_values = {}
@@ -588,119 +630,105 @@ class GeneratorFullModel(torch.nn.Module):
             loss_values['expression'] = self.loss_weights['expression'] * value
 
         return loss_values
-
-class ExpressionRefinerFullModel(torch.nn.Module):
-    def __init__(self, kp_extractor,
-                 he_estimator,
-                 generator,
-                 expr_refiner,
-                 train_params,
-                 device=None,
-                 estimate_jacobian=False,):
-        super().__init__()
-        self.train_params = train_params
-        self.kp_extractor = kp_extractor.eval()
-        self.he_estimator = he_estimator.eval()
-        self.generator = generator.eval()
-        self.expr_refiner = expr_refiner
-        self.estimate_jacobian = estimate_jacobian
-        
-        # Loss functions
-        weights = self.train_params['gaze_loss']['path'] #"gaze_models/gazeestimation_gazetr.pt"
-        self.gaze = Model(criterion=self.train_params['gaze_loss']['criterion']).to(device)
-        self.gaze.load_state_dict(torch.load(weights))
-        self.gaze.eval()
-
-        # ID Loss #TODO: Change the face detector to VGGFace or ArcFace (ArcFace had the embedding problem)
-        self.face_detector = retinanet_resnet50_fpn(pretrained=True).to(device).eval()
-
-        # Face parser
-        self.face_parser = FaceParser(device=device) #NOTE: Check other args
-
-
-    @torch.no_grad()
-    def get_embeddings(self, image):
-        features = self.face_detector.backbone.body(image)['2']
-        embeddings = F.avg_pool2d(features, kernel_size=features.size()[2:]).view(image.size(0), -1)
-        return embeddings
-
-    def loss_id(self, i,j, device):
-        return F.cosine_embedding_loss(i,j, torch.ones(i.shape[0]).to(device))
-
-    def forward(self, x, add_expression=True, rec_driving=False, compute_loss=True):
-        with torch.no_grad():
-            # Step1: Reenactment
-            kp_canonical = self.kp_extractor(x['source'])     # {'value': value, 'jacobian': jacobian, 'heatmap': heatmap}   
-            kp_canonical_d = self.kp_extractor(x['driving'])
-
-            he_source = self.he_estimator(x['source'])        # {'yaw': yaw, 'pitch': pitch, 'roll': roll, 't': t, 'exp': exp}
-            he_driving = self.he_estimator(x['driving'])      # {'yaw': yaw, 'pitch': pitch, 'roll': roll, 't': t, 'exp': exp}
-
-            kp_source = keypoint_transformation(kp_canonical, he_source, self.estimate_jacobian, add_expression=add_expression)
-            kp_driving = keypoint_transformation(kp_canonical, he_driving, self.estimate_jacobian, add_expression=add_expression)
-
-            generated = self.generator(x['source'], x['driving'], kp_source=kp_source,
-                                    kp_driving=kp_driving, rec_driving=rec_driving)
-            generated.update({'kp_source': kp_source, 'kp_driving': kp_driving, 'heatmap_driving': kp_canonical_d['heatmap']})
-
-        # Step2: Refinement
-        out = self.expr_refiner(generated['prediction'][-1], generated['heatmap_driving'])
-        generated.update({'prediction_refined': out})
-
-        if not compute_loss:
-            loss_values = {}
-            return loss_values, generated
-        else:
-            loss_values = self._compute_loss(x, generated)
-            return loss_values, generated
-
-    def _compute_loss(self, x, generated):
+    
+    def _compute_loss_stage2(self,
+                             x: dict,
+                             generated: dict):
+        """
+        Computes loss functions for training stage 2
+        """
         loss_values = {}
-        if self.train_params['gaze_loss']['weight'] != 0:
-            # Gaze Loss
-            gaze_loss = 1 - self.gaze.loss(generated['prediction_refined'], x['driving'].detach())
-            loss_values['gaze_loss'] = self.train_params['gaze_loss']['weight'] * gaze_loss
 
-        if self.train_params['wing_loss']['weight'] != 0:
+        pyramide_real = self.pyramid(x['driving'])
+        pyramide_generated = ImagePyramide.make_dict(generated['prediction'],
+                                                     self.scales[::-1])
+
+        if sum(self.loss_weights['perceptual']['vgg']) != 0:
+            value_total = 0
+            for scale in self.scales:
+                x_vgg = self.vgg(pyramide_generated['prediction_' + str(scale)])
+                y_vgg = self.vgg(pyramide_real['prediction_' + str(scale)])
+
+                for i, weight in enumerate(self.loss_weights['perceptual']):
+                    value = torch.abs(x_vgg[i] - y_vgg[i].detach()).mean()
+                    value_total += self.loss_weights['perceptual']['vgg'][i] * value
+            loss_values['perceptual'] = value_total
+        
+        # Ternary Loss
+        if self.loss_weights['perceptual']['ternary'] != 0:
+            value = 0
+            for scale in self.scales:
+                value += TernaryLoss(
+                    pyramide_real['prediction_' + str(scale)].detach(),
+                    pyramide_generated['prediction_' + str(scale)],
+                ).mean()
+            loss_values['perceptual'] += self.loss_weights['perceptual']['l1'] * value / len(self.scales)
+        
+        if self.loss_weights['perceptual']['l1'] != 0:
+            value = 0
+            for scale in self.scales:
+                value += (pyramide_generated['prediction_' + str(scale)] - pyramide_real['prediction_' + str(scale)].detach()).abs().mean()
+            loss_values['perceptual'] += self.loss_weights['perceptual']['l1'] * value / len(self.scales)
+            
+
+        if self.loss_weights['generator_gan'] != 0:
+            discriminator_maps_generated = self.discriminator(pyramide_generated)
+            discriminator_maps_real = self.discriminator(pyramide_real)
+            value_total = 0
+            for scale in self.disc_scales:
+                key = 'prediction_map_%s' % scale
+                if self.train_params['gan_mode'] == 'hinge':
+                    value = -torch.mean(discriminator_maps_generated[key])
+                elif self.train_params['gan_mode'] == 'ls':
+                    value = ((1 - discriminator_maps_generated[key]) ** 2).mean()
+                else:
+                    raise ValueError('Unexpected gan_mode {}'.format(self.train_params['gan_mode']))
+
+                value_total += self.loss_weights['generator_gan'] * value
+            loss_values['gen_gan'] = value_total
+
+            if sum(self.loss_weights['feature_matching']) != 0:
+                value_total = 0
+                for scale in self.disc_scales:
+                    key = 'feature_maps_%s' % scale
+                    for i, (a, b) in enumerate(zip(discriminator_maps_real[key], discriminator_maps_generated[key])):
+                        if self.loss_weights['feature_matching'][i] == 0:
+                            continue
+                        value = torch.abs(a - b).mean()
+                        value_total += self.loss_weights['feature_matching'][i] * value
+                    loss_values['feature_matching'] = value_total
+                
+        if self.loss_weights['gaze_loss'] != 0:
+            # Gaze Loss
+            gaze_loss = 1 - self.gaze.loss(generated['prediction'][-1], x['driving'].detach())
+            loss_values['gaze_loss'] = self.loss_weights['gaze_loss'] * gaze_loss
+
+        if self.loss_weights['wing_loss'] != 0:
             # Wing Loss
-            kp_refined_canonical = self.kp_extractor(generated['prediction_refined'])
-            he_refined = self.he_estimator(generated['prediction_refined'])
+            kp_refined_canonical = self.kp_extractor(generated['prediction'][-1])
+            he_refined = self.he_estimator(generated['prediction'][-1])
             kp_refined = keypoint_transformation(kp_refined_canonical, he_refined, estimate_jacobian=False)
             
             wing_loss = F.smooth_l1_loss(kp_refined['value'], generated['kp_driving']['value'].detach())
-            loss_values['wing_loss'] = self.train_params['wing_loss']['weight'] * wing_loss
+            loss_values['wing_loss'] = self.loss_weights['wing_loss'] * wing_loss
         
-        if self.train_params['id_loss']['weight'] != 0:
+        if self.loss_weights['id_loss'] != 0:
             # ID Loss
-            embed_gen = self.get_embeddings(generated['prediction_refined'])
+            embed_gen = self.get_embeddings(generated['prediction'][-1])
             embed_src = self.get_embeddings(x['source'])
-            loss_values['id_loss'] = self.train_params['id_loss']['weight'] *\
-                self.loss_id(embed_gen, embed_src, device=generated['prediction_refined'].device)
+            loss_values['id_loss'] = self.loss_weights['id_loss'] *\
+                self.loss_id(embed_gen, embed_src, device=generated['prediction'][-1].device)
 
-        if self.train_params['pixel_loss']['weight'] != 0:
+        if self.loss_weights['pixel_loss'] != 0:
             # Masks only from driving (they should match the reenacted)
             masks = self.face_parser(x['driving'], keep=['eyes', 'lips', 'mouth'])
-            refined_masked = generated['prediction_refined'] * masks
+            refined_masked = generated['prediction'][-1] * masks
             driving_masked = x['driving'] * masks
-            pixel_loss = F.smooth_l1_loss(refined_masked, driving_masked, reduction='sum') / (
+            pixel_loss = F.smooth_l1_loss(refined_masked, driving_masked.detach(), reduction='sum') / (
                 masks.sum() + 1e-8
             )
-            loss_values['pixel_loss'] = self.train_params['pixel_loss']['weight'] * pixel_loss
-
-        # Ternary Loss
-        if self.train_params['ternary']['weight'] != 0:
-            value = 0
-            
-            value += TernaryLoss(
-                x['driving'].detach(),
-                generated['prediction_refined'],
-            ).mean()
-            loss_values['ternary'] = self.train_params['ternary']['weight'] * value
+            loss_values['pixel_loss'] = self.loss_weights['pixel_loss'] * pixel_loss
         
-        if self.train_params['l1']['weight'] != 0:
-            value = 0
-            value += (generated['prediction_refined'] - x['driving'].detach()).abs().mean()
-            loss_values['l_one'] = self.train_params['l1']['weight'] * value
 
         return loss_values
 

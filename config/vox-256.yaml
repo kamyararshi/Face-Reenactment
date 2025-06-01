@@ -100,8 +100,9 @@ train_params:
   refinement_stage:
     num_epochs: 100
     num_repeats: 1
-    epoch_milestones: [50,80]
-    lr_refiner: 1.0e-4
+    epoch_milestones: [40,80]
+    lr_generator: 2.0e-4
+    lr_discriminator: 2.0e-4
     gan_mode: 'hinge'    # hinge or ls
     batch_size: 16
     scales: [1, 0.5, 0.25, 0.125]
@@ -109,17 +110,18 @@ train_params:
     gaze_loss:
       path: 'gaze_models/gazeestimation_gazetr.pt'
       criterion: 'cosine'
-      weight: 40
-    wing_loss:
-      weight: 40
-    id_loss:
-      weight: 40
-    pixel_loss:
-      weight: 40
-    ternary:
-      weight: 10
-    l1:
-      weight: 0
+    loss_weights:
+      generator_gan: 1                  
+      discriminator_gan: 1
+      feature_matching: [10, 10, 10, 10]
+      perceptual: 
+        vgg: [10, 10, 10, 10, 10]
+        ternary: 10
+        l1: 0 #10
+      pixel_loss: 40
+      id_loss: 40
+      wing_loss: 40
+      gaze_loss: 40    
 
 
 visualizer_params:

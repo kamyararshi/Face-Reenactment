@@ -124,30 +124,38 @@ if __name__ == "__main__":
         if len(opt.device_ids)>1 and torch.cuda.device_count()>1:
             from train_ddp import train
             import torch.multiprocessing as mp
-            print("Training with DDP...")
+            print("Training Base with DDP...")
             world_size = len(opt.device_ids)
-            mp.spawn(train, args=(world_size, config, generator, discriminator, kp_detector, he_estimator, opt, log_dir, dataset, val_dataset),
+            mp.spawn(train, args=(world_size, config, generator, discriminator, kp_detector, he_estimator, opt, log_dir, dataset, val_dataset, opt.stage),
                      nprocs=world_size, join=True)
         else:
             from train import train
-            print("Training with Single GPU...")
+            print("Training Base with Single GPU...")
             train(config, generator, discriminator, kp_detector, he_estimator, opt, log_dir, dataset, val_dataset, device_id)
     
     elif opt.stage == 'refiner':
-        refiner = ExpressionRefiner(**config['model_params']['refiner_params'],
-                                    **config['model_params']['common_params'])
-        if torch.cuda.is_available():
-            refiner.to(device_id)
-        if opt.verbose:
-            print(refiner)
-
         if len(opt.device_ids)>1 and torch.cuda.device_count()>1:
-            from train_ddp import train_refiner
+            from train_ddp import train
             import torch.multiprocessing as mp
-            print("Training with DDP...")
+            print("Training Refiner with DDP...")
             world_size = len(opt.device_ids)
-            mp.spawn(train_refiner,
-                     args=(world_size, config, generator, refiner, kp_detector, he_estimator, opt, log_dir, dataset, val_dataset),
+            mp.spawn(train, args=(world_size, config, generator, discriminator, kp_detector, he_estimator, opt, log_dir, dataset, val_dataset, opt.stage),
                      nprocs=world_size, join=True)
+
+        # refiner = ExpressionRefiner(**config['model_params']['refiner_params'],
+        #                             **config['model_params']['common_params'])
+        # if torch.cuda.is_available():
+        #     refiner.to(device_id)
+        # if opt.verbose:
+        #     print(refiner)
+
+        # if len(opt.device_ids)>1 and torch.cuda.device_count()>1:
+        #     from train_ddp import train_refiner
+        #     import torch.multiprocessing as mp
+        #     print("Training with DDP...")
+        #     world_size = len(opt.device_ids)
+        #     mp.spawn(train_refiner,
+        #              args=(world_size, config, generator, refiner, kp_detector, he_estimator, opt, log_dir, dataset, val_dataset),
+        #              nprocs=world_size, join=True)
         else:
             raise ValueError("Refiner training is not supported in single GPU mode yet.")

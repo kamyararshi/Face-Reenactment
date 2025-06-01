@@ -24,37 +24,60 @@ def ddp_setup(rank: int, world_size: int, backend: str='nccl', MASTER_ADDR: str=
     
 def train(rank: int, world_size: int, config: dict,
             generator: nn.Module, discriminator: nn.Module, kp_detector: nn.Module, he_estimator: nn.Module,
-            opt: dict, log_dir: str, dataset: Dataset, val_dataset: Dataset, writer: bool=True) -> None:
-    train_params = config['train_params']
+            opt: dict, log_dir: str, dataset: Dataset, val_dataset: Dataset, 
+            stage: str, writer: bool=True) -> None:
+    if stage == 'base':
+        print(f"Base Configs loaded rank {rank}")
+        train_params = config['train_params']
+    elif stage == 'refiner':
+        print(f"Refiner Configs loaded rank {rank}")
+        train_params = config['train_params']['refinement_stage']
     device = rank
     ddp_setup(rank=device, world_size=world_size)
 
     optimizer_generator = torch.optim.AdamW(generator.parameters(), lr=train_params['lr_generator'], betas=(0.5, 0.999))
     optimizer_discriminator = torch.optim.AdamW(discriminator.parameters(), lr=train_params['lr_discriminator'], betas=(0.5, 0.999))
-    optimizer_kp_detector = torch.optim.AdamW(kp_detector.parameters(), lr=train_params['lr_kp_detector'], betas=(0.5, 0.999))
-    optimizer_he_estimator = torch.optim.AdamW(he_estimator.parameters(), lr=train_params['lr_he_estimator'], betas=(0.5, 0.999))
+    if stage == 'base':
+        optimizer_kp_detector = torch.optim.AdamW(kp_detector.parameters(), lr=train_params['lr_kp_detector'], betas=(0.5, 0.999))
+        optimizer_he_estimator = torch.optim.AdamW(he_estimator.parameters(), lr=train_params['lr_he_estimator'], betas=(0.5, 0.999))
+    elif stage == 'refiner':
+        optimizer_kp_detector = None
+        optimizer_he_estimator = None
 
     if opt.checkpoint is not None:
         start_epoch, global_epoch = Logger.load_cpk(opt.checkpoint, generator, discriminator, kp_detector, he_estimator,
                                       optimizer_generator, optimizer_discriminator, optimizer_kp_detector, optimizer_he_estimator, rank=rank)
+        if stage == 'refiner':
+            start_epoch, global_epoch = 0, 0 # Reset epoch for refiner stage #TODO: Add Cont. training for refiner
     else:
-        start_epoch, global_epoch = 0, 0
+        if stage == 'refiner':
+            if opt.refiner_checkpoint is not None:
+                start_epoch, global_epoch = Logger.load_cpk(opt.refiner_checkpoint, generator, discriminator, kp_detector, he_estimator,
+                                      optimizer_generator, optimizer_discriminator, optimizer_kp_detector, optimizer_he_estimator, rank=rank)
+                print(f"Refiner Checkpoint loaded from {opt.refiner_checkpoint}")
+            else:
+                raise ValueError("Checkpoint is required for the refiner stage. Please provide a valid checkpoint path.")
+        else:
+            start_epoch, global_epoch = 0, 0
 
     scheduler_generator = MultiStepLR(optimizer_generator, train_params['epoch_milestones'], gamma=0.1,
                                       last_epoch=start_epoch - 1)
     scheduler_discriminator = MultiStepLR(optimizer_discriminator, train_params['epoch_milestones'], gamma=0.1,
                                           last_epoch=start_epoch - 1)
-    scheduler_kp_detector = MultiStepLR(optimizer_kp_detector, train_params['epoch_milestones'], gamma=0.1,
-                                        last_epoch=-1 + start_epoch * (train_params['lr_kp_detector'] != 0))
-    scheduler_he_estimator = MultiStepLR(optimizer_he_estimator, train_params['epoch_milestones'], gamma=0.1,
-                                        last_epoch=-1 + start_epoch * (train_params['lr_kp_detector'] != 0))
+    if stage == 'base':
+        scheduler_kp_detector = MultiStepLR(optimizer_kp_detector, train_params['epoch_milestones'], gamma=0.1,
+                                            last_epoch=-1 + start_epoch * (train_params['lr_kp_detector'] != 0))
+        scheduler_he_estimator = MultiStepLR(optimizer_he_estimator, train_params['epoch_milestones'], gamma=0.1,
+                                            last_epoch=-1 + start_epoch * (train_params['lr_kp_detector'] != 0))
 
     if 'num_repeats' in train_params or train_params['num_repeats'] != 1:
         dataset = DatasetRepeater(dataset, train_params['num_repeats'])
     dataloader = DataLoader(dataset, batch_size=train_params['batch_size'], shuffle=False, num_workers=0, drop_last=False, sampler=DistributedSampler(dataset))
     val_loader = DataLoader(val_dataset, batch_size=train_params['batch_size'], shuffle=False, num_workers=0, sampler=DistributedSampler(val_dataset))
 
-    generator_full = GeneratorFullModel(kp_detector, he_estimator, generator, discriminator, train_params, estimate_jacobian=config['model_params']['common_params']['estimate_jacobian'], device=device).to(device)
+    generator_full = GeneratorFullModel(kp_detector, he_estimator, generator, discriminator, train_params,
+                                        estimate_jacobian=config['model_params']['common_params']['estimate_jacobian'],
+                                        train_stage=stage, device=device).to(device)
     generator_full = DDP(generator_full, device_ids=[device], find_unused_parameters=True) # Wrap the model with DDP
     discriminator_full = DiscriminatorFullModel(kp_detector, generator, discriminator, train_params, device=device).to(device)
     discriminator_full = DDP(discriminator_full, device_ids=[device], find_unused_parameters=True) # Wrap the model with DDP
@@ -66,22 +89,29 @@ def train(rank: int, world_size: int, config: dict,
 
     with Logger(log_dir=log_dir, visualizer_params=config['visualizer_params'], checkpoint_freq=train_params['checkpoint_freq'], writer=writer, ddp=True) as logger:
         for epoch in trange(start_epoch, train_params['num_epochs'], initial=start_epoch, total=train_params['num_epochs']):
-            generator_full.train()
+            
+            if stage == 'base':
+                generator_full.train()
+            elif stage == 'refiner':
+                generator_full.module._set_train()
+
             for x in tqdm(dataloader):
                 optimizer_generator.zero_grad()
-                optimizer_kp_detector.zero_grad()
-                optimizer_he_estimator.zero_grad()
+                if stage == 'base':
+                    optimizer_kp_detector.zero_grad()
+                    optimizer_he_estimator.zero_grad()
 
                 global_epoch += 1
                 x = {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in x.items()}
-                losses_generator, generated = generator_full(x, add_expression=opt.add_expr, rec_driving=opt.rec_driv)
+                losses_generator, generated = generator_full(x, add_expression=opt.add_expr, rec_driving=opt.rec_driv, compute_loss=True)
                 loss_values = [val.mean() for val in losses_generator.values()]
                 loss = sum(loss_values)
 
                 loss.backward()
                 optimizer_generator.step()
-                optimizer_kp_detector.step()
-                optimizer_he_estimator.step()
+                if stage == 'base':
+                    optimizer_kp_detector.step()
+                    optimizer_he_estimator.step()
                 # nn.utils.clip_grad_norm_(generator_full.parameters(), 1.0)                
 
                 if train_params['loss_weights']['generator_gan'] != 0:
@@ -107,19 +137,29 @@ def train(rank: int, world_size: int, config: dict,
 
             scheduler_generator.step()
             scheduler_discriminator.step()
-            scheduler_kp_detector.step()
-            scheduler_he_estimator.step()
+            if stage == 'base':
+                scheduler_kp_detector.step()
+                scheduler_he_estimator.step()
             
             if rank == 0: # Only the master node saves the checkpoint
-                logger.log_epoch(epoch, global_epoch,
-                                    {'generator': generator,
-                                        'discriminator': discriminator,
-                                        'kp_detector': kp_detector,
-                                        'he_estimator': he_estimator,
-                                        'optimizer_generator': optimizer_generator,
-                                        'optimizer_discriminator': optimizer_discriminator,
-                                        'optimizer_kp_detector': optimizer_kp_detector,
-                                        'optimizer_he_estimator': optimizer_he_estimator}, inp=x, out=generated)
+                if stage == 'base':
+                    logger.log_epoch(epoch, global_epoch,
+                                        {'generator': generator,
+                                            'discriminator': discriminator,
+                                            'kp_detector': kp_detector,
+                                            'he_estimator': he_estimator,
+                                            'optimizer_generator': optimizer_generator,
+                                            'optimizer_discriminator': optimizer_discriminator,
+                                            'optimizer_kp_detector': optimizer_kp_detector,
+                                            'optimizer_he_estimator': optimizer_he_estimator}, inp=x, out=generated)
+                elif stage == 'refiner':
+                    logger.log_epoch(epoch, global_epoch,
+                                        {'generator': generator,
+                                            'discriminator': discriminator,
+                                            'kp_detector': kp_detector,
+                                            'he_estimator': he_estimator,
+                                            'optimizer_generator': optimizer_generator,
+                                            'optimizer_discriminator': optimizer_discriminator}, inp=x, out=generated)
             
                 # Validation
                 _ = run_validation(generator_full, val_loader, device, epoch, logger, writer)

@@ -217,13 +217,13 @@ class Logger:
             Logger.move_optimizer_states(optimizer_he_estimator, map_location)
 
         # Stage 2 -- Expression refiner
-        if (refiner is not None) and (refiner_checkpoint_path is not None):
-            checkpoint = torch.load(refiner_checkpoint_path, map_location=map_location)
-            refiner.load_state_dict(checkpoint['refiner'])
+        # if (refiner is not None) and (refiner_checkpoint_path is not None):
+        #     checkpoint = torch.load(refiner_checkpoint_path, map_location=map_location)
+        #     refiner.load_state_dict(checkpoint['refiner'])
 
-            if optimizer_refiner is not None:
-                optimizer_refiner.load_state_dict(checkpoint['optimizer_refiner'])
-                Logger.move_optimizer_states(optimizer_refiner, map_location)
+        #     if optimizer_refiner is not None:
+        #         optimizer_refiner.load_state_dict(checkpoint['optimizer_refiner'])
+        #         Logger.move_optimizer_states(optimizer_refiner, map_location)
 
 
         # Return epoch and global epoch for resuming training
